@@ -10,6 +10,9 @@ void main() {
     // Build our app and trigger a frame.
     await tester.pumpWidget(const XFGWalletApp());
 
+    // Wait for animations to complete (splash screen has typewriter animation)
+    await tester.pumpAndSettle();
+
     // Verify that our app starts with the splash screen
     expect(find.text('Fyrefly XF₲_wallet'), findsOneWidget);
     expect(find.text('Privacy Blockchain Banking'), findsOneWidget);
