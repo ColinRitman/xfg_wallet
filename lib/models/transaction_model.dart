@@ -40,4 +40,9 @@ class TransactionModel {
       'recipientAddress': recipientAddress,
     };
   }
+
+  // Convenience getter for date formatting
+  String get date {
+    return '${timestamp.day}/${timestamp.month}/${timestamp.year}';
+  }
 }
