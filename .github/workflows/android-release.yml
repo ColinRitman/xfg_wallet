@@ -61,9 +61,11 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: 'stable'
+          cache: true
 
       - name: Enable Android support
         run: flutter config --enable-android
+        continue-on-error: false
 
       - name: Download xfg-stark-cli
         run: |
@@ -72,6 +74,18 @@ jobs:
           mkdir -p assets/bin
           mv xfg-stark-cli-linux assets/bin/
         continue-on-error: false
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
@@ -93,10 +107,12 @@ jobs:
           echo "storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}" >> android/key.properties
           echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" >> android/key.properties
           echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}" >> android/key.properties
+        continue-on-error: false
 
       - name: Build APK (Debug)
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'debug')
         run: flutter build apk --debug
+        continue-on-error: false
 
       - name: Build APK (Release)
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
@@ -104,6 +120,7 @@ jobs:
           cd android
           ./gradlew assembleRelease
           cd ..
+        continue-on-error: false
 
       - name: Build AAB (Release)
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
@@ -111,6 +128,7 @@ jobs:
           cd android
           ./gradlew bundleRelease
           cd ..
+        continue-on-error: false
 
       - name: Sign APK with apksigner
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
@@ -123,11 +141,13 @@ jobs:
             --key-pass pass:${{ secrets.ANDROID_KEY_PASSWORD }} \
             --out build/app/outputs/flutter-apk/app-release-signed.apk \
             build/app/outputs/flutter-apk/app-release.apk
+        continue-on-error: false
 
       - name: Verify APK signature
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
         run: |
           $ANDROID_HOME/build-tools/34.0.0/apksigner verify build/app/outputs/flutter-apk/app-release-signed.apk
+        continue-on-error: false
 
       - name: Create APK archive
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
@@ -139,6 +159,7 @@ jobs:
             cp app-release.apk XF₲-Wallet-Android-Release.apk
           fi
           zip -r XF₲-Wallet-Android-Release.zip XF₲-Wallet-Android-Release.apk
+        continue-on-error: false
 
       - name: Create AAB archive
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
@@ -146,6 +167,7 @@ jobs:
           cd build/app/outputs/bundle/release
           cp app-release.aab XF₲-Wallet-Android-Release.aab
           zip -r XF₲-Wallet-Android-Release-AAB.zip XF₲-Wallet-Android-Release.aab
+        continue-on-error: false
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4

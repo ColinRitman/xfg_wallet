@@ -43,9 +43,11 @@ jobs:
         with:
           flutter-version: '3.27.0'
           channel: 'stable'
+          cache: true
 
       - name: Enable macOS desktop support
         run: flutter config --enable-macos-desktop
+        continue-on-error: false
 
       - name: Download xfg-stark-cli
         run: |
@@ -54,6 +56,18 @@ jobs:
           mkdir -p assets/bin
           mv xfg-stark-cli-macos assets/bin/
         continue-on-error: false
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
@@ -68,6 +82,9 @@ jobs:
         run: |
           cd build/macos/Build/Products/Release
           zip -r Fuego-Wallet-macOS.zip "fuego_wallet.app"
+        continue-on-error: false
+        continue-on-error: false
+        continue-on-error: false
         continue-on-error: false
 
       - name: Upload build artifacts
@@ -98,9 +115,11 @@ jobs:
         with:
           flutter-version: '3.27.0'
           channel: 'stable'
+          cache: true
 
       - name: Enable Windows desktop support
         run: flutter config --enable-windows-desktop
+        continue-on-error: false
 
       - name: Download xfg-stark-cli
         run: |
@@ -108,6 +127,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path assets\bin
           Move-Item xfg-stark-cli-windows.exe assets\bin\xfg-stark-cli.exe
         continue-on-error: false
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
@@ -128,6 +159,9 @@ jobs:
           } else {
             Get-ChildItem build -Recurse | Where-Object { $_.Name -like "*.exe" } | Select-Object -First 1 | ForEach-Object { Compress-Archive -Path $_.DirectoryName -DestinationPath "Fuego-Wallet-Windows.zip" }
           }
+        continue-on-error: false
+        continue-on-error: false
+        continue-on-error: false
         continue-on-error: false
 
       - name: Upload build artifacts
@@ -158,6 +192,7 @@ jobs:
         with:
           flutter-version: '3.27.0'
           channel: 'stable'
+          cache: true
 
       - name: Download xfg-stark-cli
         run: |
@@ -172,6 +207,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev
           flutter config --enable-linux-desktop
+        continue-on-error: false
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
@@ -199,6 +247,10 @@ jobs:
         run: |
           cd build/linux/x64/release/bundle
           tar -czf XF₲-Wallet-Linux-GLIBC-2.31.tar.gz *
+        continue-on-error: false
+        continue-on-error: false
+        continue-on-error: false
+        continue-on-error: false
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -267,6 +319,7 @@ jobs:
         with:
           flutter-version: '3.27.0'
           channel: 'stable'
+          cache: true
 
       - name: Download xfg-stark-cli
         run: |
@@ -281,6 +334,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev
           flutter config --enable-linux-desktop
+        continue-on-error: false
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
@@ -294,6 +360,10 @@ jobs:
         run: |
           cd build/linux/x64/release/bundle
           tar -czf XF₲-Wallet-Linux-Latest.tar.gz *
+        continue-on-error: false
+        continue-on-error: false
+        continue-on-error: false
+        continue-on-error: false
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
