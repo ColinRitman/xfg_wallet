@@ -1,0 +1,2 @@
+# This directory contains platform-specific binaries downloaded during CI builds
+# The actual binaries are downloaded by the GitHub Actions workflows

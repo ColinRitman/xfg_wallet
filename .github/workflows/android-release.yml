@@ -67,11 +67,14 @@ jobs:
         run: flutter config --enable-android
         continue-on-error: false
 
+      - name: Create assets directory
+        run: mkdir -p assets/bin
+        continue-on-error: false
+
       - name: Download xfg-stark-cli
         run: |
           curl -L -o xfg-stark-cli-linux "https://github.com/ColinRitman/xfgwin/releases/download/v0.8.8/xfg-stark-cli-linux"
           chmod +x xfg-stark-cli-linux
-          mkdir -p assets/bin
           mv xfg-stark-cli-linux assets/bin/
         continue-on-error: false
 
