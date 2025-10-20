@@ -38,14 +38,29 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache Flutter SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/flutter
+          key: ${{ runner.os }}-flutter-sdk-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-sdk-
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.35.5'
           channel: 'stable'
+          cache: true
 
-      - name: Enable macOS desktop support
-        run: flutter config --enable-macos-desktop
+      - name: Install macOS dependencies
+        run: |
+          # Install Xcode command line tools
+          sudo xcode-select --install || true
+          # Install CocoaPods
+          sudo gem install cocoapods
+          # Enable macOS desktop support
+          flutter config --enable-macos-desktop
 
       - name: Download xfg-stark-cli
         run: |
@@ -53,12 +68,55 @@ jobs:
           chmod +x xfg-stark-cli-macos
           mkdir -p assets/bin
           mv xfg-stark-cli-macos assets/bin/
+          # Verify download
+          if [ ! -f "assets/bin/xfg-stark-cli-macos" ]; then
+            echo "Failed to download xfg-stark-cli for macOS"
+            exit 1
+          fi
+          echo "xfg-stark-cli downloaded successfully"
+
+      - name: Clean previous builds
+        run: flutter clean
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+            **/.dart_tool/package_config.json
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Validate Flutter setup
+        run: |
+          flutter doctor -v
+          flutter analyze
+
+      - name: Verify assets
+        run: |
+          if [ ! -d "assets/bin" ]; then
+            echo "Assets directory not found"
+            exit 1
+          fi
+          echo "Assets directory verified"
+
       - name: Build macOS desktop app
-        run: flutter build macos --release
+        run: timeout 1800 flutter build macos --release
+
+      - name: Verify macOS build
+        run: |
+          if [ ! -d "build/macos/Build/Products/Release/fuego_wallet.app" ]; then
+            echo "macOS build failed - app bundle not found"
+            exit 1
+          fi
+          echo "macOS build successful"
 
       - name: Create app archive
         run: |
@@ -88,11 +146,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache Flutter SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/flutter
+          key: ${{ runner.os }}-flutter-sdk-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-sdk-
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.35.5'
           channel: 'stable'
+          cache: true
 
       - name: Enable Windows desktop support
         run: flutter config --enable-windows-desktop
@@ -102,12 +169,66 @@ jobs:
           curl -L -o xfg-stark-cli-windows.exe "https://github.com/ColinRitman/xfgwin/releases/download/v0.8.8/xfg-stark-cli-windows.exe"
           New-Item -ItemType Directory -Force -Path assets\bin
           Move-Item xfg-stark-cli-windows.exe assets\bin\xfg-stark-cli.exe
+          # Verify download
+          if (-not (Test-Path "assets\bin\xfg-stark-cli.exe")) {
+            Write-Error "Failed to download xfg-stark-cli for Windows"
+            exit 1
+          }
+          Write-Host "xfg-stark-cli downloaded successfully"
+
+      - name: Clean previous builds
+        run: flutter clean
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+            **/.dart_tool/package_config.json
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Validate Flutter setup
+        run: |
+          flutter doctor -v
+          flutter analyze
+
+      - name: Verify assets
+        run: |
+          if [ ! -d "assets/bin" ]; then
+            echo "Assets directory not found"
+            exit 1
+          fi
+          echo "Assets directory verified"
+
       - name: Build Windows desktop app
-        run: flutter build windows --release
+        run: |
+          $timeout = 1800
+          $job = Start-Job -ScriptBlock { flutter build windows --release }
+          $job | Wait-Job -Timeout $timeout
+          if ($job.State -eq "Running") {
+            Stop-Job $job
+            Remove-Job $job
+            Write-Error "Build timed out after $timeout seconds"
+            exit 1
+          }
+          Receive-Job $job
+          Remove-Job $job
+
+      - name: Verify Windows build
+        run: |
+          if (-not (Test-Path "build\windows\runner\Release\fuego_wallet.exe") -and -not (Test-Path "build\windows\x64\runner\Release\fuego_wallet.exe")) {
+            Write-Error "Windows build failed - executable not found"
+            exit 1
+          }
+          Write-Host "Windows build successful"
 
       - name: Create app archive
         run: |
@@ -137,18 +258,27 @@ jobs:
           files: Fuego-Wallet-Windows.zip
 
   build-linux-compat:
-    name: Build XF₲ Wallet (Linux - GLIBC 2.35)
+    name: Build XF₲ Wallet (Linux - GLIBC 2.31)
     runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache Flutter SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/flutter
+          key: ${{ runner.os }}-flutter-sdk-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-sdk-
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.35.5'
           channel: 'stable'
+          cache: true
 
       - name: Download xfg-stark-cli
         run: |
@@ -156,19 +286,60 @@ jobs:
           chmod +x xfg-stark-cli-linux
           mkdir -p assets/bin
           mv xfg-stark-cli-linux assets/bin/
+          # Verify download
+          if [ ! -f "assets/bin/xfg-stark-cli-linux" ]; then
+            echo "Failed to download xfg-stark-cli for Linux"
+            exit 1
+          fi
+          echo "xfg-stark-cli downloaded successfully"
 
       - name: Enable Linux desktop support
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libblkid-dev libudev-dev
           flutter config --enable-linux-desktop
+
+      - name: Clean previous builds
+        run: flutter clean
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+            **/.dart_tool/package_config.json
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Build Linux desktop app (GLIBC 2.35)
+      - name: Validate Flutter setup
         run: |
-          flutter build linux --release
+          flutter doctor -v
+          flutter analyze
+
+      - name: Verify assets
+        run: |
+          if [ ! -d "assets/bin" ]; then
+            echo "Assets directory not found"
+            exit 1
+          fi
+          echo "Assets directory verified"
+
+      - name: Build Linux desktop app (GLIBC 2.31)
+        run: |
+          timeout 1800 flutter build linux --release
+          # Verify build
+          if [ ! -f "build/linux/x64/release/bundle/fuego_wallet" ]; then
+            echo "Linux build failed - executable not found"
+            exit 1
+          fi
+          echo "Linux build successful"
           # Create a portable build by copying required libraries
           cd build/linux/x64/release/bundle
           mkdir -p lib
@@ -202,12 +373,14 @@ jobs:
           files: build/linux/x64/release/bundle/XF₲-Wallet-Linux-GLIBC-2.31.tar.gz
           name: XF₲-Wallet-Linux-GLIBC-2.31.tar.gz
 
-      - name: Create AppImage (GLIBC 2.35)
+      - name: Create AppImage (GLIBC 2.31)
         run: |
           cd build/linux/x64/release/bundle
           # Download appimagetool
           curl -LO https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
+          # Copy icon file for AppImage
+          cp ../../../../../app_icon_256.png fuego_wallet.png
           # Create desktop file for AppImage
           cat > XF₲-Wallet.desktop << 'EOF'
           [Desktop Entry]
@@ -218,27 +391,26 @@ jobs:
           Icon=fuego_wallet
           Categories=Finance;
           EOF
-          # Copy icon file
-          cp ../../../../../app_icon_256.png fuego_wallet.png
           # Create AppImage (using extraction to avoid FUSE)
           ./appimagetool-x86_64.AppImage --appimage-extract
-          ./squashfs-root/AppRun . XF₲-Wallet-Linux-GLIBC-2.35.AppImage
+          ./squashfs-root/AppRun . XF₲-Wallet-Linux-GLIBC-2.31.AppImage
           # Clean up
           rm -f appimagetool-x86_64.AppImage
+          rm -rf squashfs-root
 
       - name: Upload AppImage artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xfg-wallet-linux-glibc-235-appimage
-          path: build/linux/x64/release/bundle/XF₲-Wallet-Linux-GLIBC-2.35.AppImage
+          name: xfg-wallet-linux-glibc-231-appimage
+          path: build/linux/x64/release/bundle/XF₲-Wallet-Linux-GLIBC-2.31.AppImage
           retention-days: 30
 
       - name: Upload AppImage to Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v1
         with:
-          files: build/linux/x64/release/bundle/XF₲-Wallet-Linux-GLIBC-2.35.AppImage
-          name: XF₲-Wallet-Linux-GLIBC-2.35.AppImage
+          files: build/linux/x64/release/bundle/XF₲-Wallet-Linux-GLIBC-2.31.AppImage
+          name: XF₲-Wallet-Linux-GLIBC-2.31.AppImage
 
 
   build-linux-latest:
@@ -249,11 +421,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache Flutter SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/flutter
+          key: ${{ runner.os }}-flutter-sdk-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-sdk-
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.35.5'
           channel: 'stable'
+          cache: true
 
       - name: Download xfg-stark-cli
         run: |
@@ -261,18 +442,60 @@ jobs:
           chmod +x xfg-stark-cli-linux
           mkdir -p assets/bin
           mv xfg-stark-cli-linux assets/bin/
+          # Verify download
+          if [ ! -f "assets/bin/xfg-stark-cli-linux" ]; then
+            echo "Failed to download xfg-stark-cli for Linux"
+            exit 1
+          fi
+          echo "xfg-stark-cli downloaded successfully"
 
       - name: Enable Linux desktop support
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libblkid-dev libudev-dev
           flutter config --enable-linux-desktop
+
+      - name: Clean previous builds
+        run: flutter clean
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            **/.packages
+            **/.flutter-plugins
+            **/.flutter-plugins-dependencies
+            **/.dart_tool/package_config.json
+          key: ${{ runner.os }}-flutter-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-
 
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Validate Flutter setup
+        run: |
+          flutter doctor -v
+          flutter analyze
+
+      - name: Verify assets
+        run: |
+          if [ ! -d "assets/bin" ]; then
+            echo "Assets directory not found"
+            exit 1
+          fi
+          echo "Assets directory verified"
+
       - name: Build Linux desktop app (Latest)
-        run: flutter build linux --release
+        run: |
+          timeout 1800 flutter build linux --release
+          # Verify build
+          if [ ! -f "build/linux/x64/release/bundle/fuego_wallet" ]; then
+            echo "Linux build failed - executable not found"
+            exit 1
+          fi
+          echo "Linux build successful"
 
       - name: Create app archive
         run: |

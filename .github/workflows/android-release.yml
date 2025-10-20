@@ -36,7 +36,7 @@ on:
       contents: write
 
 env:
-  FLUTTER_VERSION: '3.24.0'
+  FLUTTER_VERSION: '3.35.5'
 
 jobs:
   build-android:
