@@ -1,4 +1,4 @@
--import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../providers/wallet_provider.dart';
 import '../../utils/theme.dart';
@@ -66,7 +66,7 @@ class _BankingScreenState extends State<BankingScreen>
       
       // Generate STARK proof using CLI
       final Map<String, dynamic> result = await CLIService.generateBurnProof(
-        privateKey: privateKey,
+        transactionHash: 'placeholder_transaction_hash',
         burnAmount: burnAmount,
         recipientAddress: recipientAddress,
       );
