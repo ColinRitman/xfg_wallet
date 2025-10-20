@@ -71,6 +71,7 @@ jobs:
           chmod +x xfg-stark-cli-linux
           mkdir -p assets/bin
           mv xfg-stark-cli-linux assets/bin/
+        continue-on-error: false
 
       - name: Install dependencies
         run: flutter pub get

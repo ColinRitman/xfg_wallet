@@ -68,6 +68,7 @@ jobs:
         run: |
           cd build/macos/Build/Products/Release
           zip -r Fuego-Wallet-macOS.zip "fuego_wallet.app"
+        continue-on-error: false
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -106,6 +107,7 @@ jobs:
           curl -L -o xfg-stark-cli-windows.exe "https://github.com/ColinRitman/xfgwin/releases/download/v0.8.8/xfg-stark-cli-windows.exe"
           New-Item -ItemType Directory -Force -Path assets\bin
           Move-Item xfg-stark-cli-windows.exe assets\bin\xfg-stark-cli.exe
+        continue-on-error: false
 
       - name: Install dependencies
         run: flutter pub get
@@ -126,6 +128,7 @@ jobs:
           } else {
             Get-ChildItem build -Recurse | Where-Object { $_.Name -like "*.exe" } | Select-Object -First 1 | ForEach-Object { Compress-Archive -Path $_.DirectoryName -DestinationPath "Fuego-Wallet-Windows.zip" }
           }
+        continue-on-error: false
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -162,6 +165,7 @@ jobs:
           chmod +x xfg-stark-cli-linux
           mkdir -p assets/bin
           mv xfg-stark-cli-linux assets/bin/
+        continue-on-error: false
 
       - name: Enable Linux desktop support
         run: |
@@ -233,6 +237,7 @@ jobs:
           ./squashfs-root/AppRun . XF₲-Wallet-Linux-GLIBC-2.35.AppImage
           # Clean up
           rm -f appimagetool-x86_64.AppImage
+        continue-on-error: false
 
       - name: Upload AppImage artifacts
         uses: actions/upload-artifact@v4
@@ -269,6 +274,7 @@ jobs:
           chmod +x xfg-stark-cli-linux
           mkdir -p assets/bin
           mv xfg-stark-cli-linux assets/bin/
+        continue-on-error: false
 
       - name: Enable Linux desktop support
         run: |
