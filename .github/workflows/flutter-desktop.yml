@@ -41,7 +41,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.27.0'
           channel: 'stable'
 
       - name: Enable macOS desktop support
@@ -53,12 +53,16 @@ jobs:
           chmod +x xfg-stark-cli-macos
           mkdir -p assets/bin
           mv xfg-stark-cli-macos assets/bin/
+        continue-on-error: false
 
       - name: Install dependencies
         run: flutter pub get
+        continue-on-error: false
+        continue-on-error: false
 
       - name: Build macOS desktop app
         run: flutter build macos --release
+        continue-on-error: false
 
       - name: Create app archive
         run: |
@@ -91,7 +95,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.27.0'
           channel: 'stable'
 
       - name: Enable Windows desktop support
@@ -105,9 +109,11 @@ jobs:
 
       - name: Install dependencies
         run: flutter pub get
+        continue-on-error: false
 
       - name: Build Windows desktop app
         run: flutter build windows --release
+        continue-on-error: false
 
       - name: Create app archive
         run: |
@@ -147,7 +153,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.27.0'
           channel: 'stable'
 
       - name: Download xfg-stark-cli
@@ -165,10 +171,12 @@ jobs:
 
       - name: Install dependencies
         run: flutter pub get
+        continue-on-error: false
 
       - name: Build Linux desktop app (GLIBC 2.35)
         run: |
           flutter build linux --release
+        continue-on-error: false
           # Create a portable build by copying required libraries
           cd build/linux/x64/release/bundle
           mkdir -p lib
@@ -208,6 +216,8 @@ jobs:
           # Download appimagetool
           curl -LO https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
+          # Copy icon file
+          cp ../../../../../../app_icon_256.png fuego_wallet.png
           # Create desktop file for AppImage
           cat > XF₲-Wallet.desktop << 'EOF'
           [Desktop Entry]
@@ -218,8 +228,6 @@ jobs:
           Icon=fuego_wallet
           Categories=Finance;
           EOF
-          # Copy icon file
-          cp ../../../../../app_icon_256.png fuego_wallet.png
           # Create AppImage (using extraction to avoid FUSE)
           ./appimagetool-x86_64.AppImage --appimage-extract
           ./squashfs-root/AppRun . XF₲-Wallet-Linux-GLIBC-2.35.AppImage
@@ -252,7 +260,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.27.0'
           channel: 'stable'
 
       - name: Download xfg-stark-cli
@@ -270,9 +278,11 @@ jobs:
 
       - name: Install dependencies
         run: flutter pub get
+        continue-on-error: false
 
       - name: Build Linux desktop app (Latest)
         run: flutter build linux --release
+        continue-on-error: false
 
       - name: Create app archive
         run: |

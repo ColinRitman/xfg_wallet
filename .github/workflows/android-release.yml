@@ -36,7 +36,7 @@ on:
       contents: write
 
 env:
-  FLUTTER_VERSION: '3.24.0'
+  FLUTTER_VERSION: '3.27.0'
 
 jobs:
   build-android:
@@ -52,6 +52,9 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -71,12 +74,15 @@ jobs:
 
       - name: Install dependencies
         run: flutter pub get
+        continue-on-error: false
 
       - name: Run tests
         run: flutter test
+        continue-on-error: false
 
       - name: Analyze code
         run: flutter analyze
+        continue-on-error: false
 
       - name: Setup Android keystore
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
