@@ -3,7 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:fuego_wallet/main.dart';
+import '../lib/main.dart';
 
 void main() {
   testWidgets('Fuego Wallet app smoke test', (WidgetTester tester) async {

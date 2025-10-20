@@ -1,4 +1,4 @@
--import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../providers/wallet_provider.dart';
 import '../../utils/theme.dart';
@@ -57,7 +57,7 @@ class _BankingScreenState extends State<BankingScreen>
 
     try {
       // Get wallet provider for private key
-      final walletProvider = Provider.of<WalletProvider>(context, listen: false);
+      // final walletProvider = Provider.of<WalletProvider>(context, listen: false);
       
       // For now, use a placeholder private key - in real implementation,
       // this would come from the wallet's private key
@@ -65,16 +65,16 @@ class _BankingScreenState extends State<BankingScreen>
       const String recipientAddress = '0x0000000000000000000000000000000000000000';
       
       // Generate STARK proof using CLI
-      final Map<String, dynamic> result = await CLIService.generateBurnProof(
-        privateKey: privateKey,
-        burnAmount: burnAmount,
+      final result = await CLIService.generateBurnProof(
+        transactionHash: 'placeholder_hash_${DateTime.now().millisecondsSinceEpoch}',
+        burnAmount: burnAmount.toInt(),
         recipientAddress: recipientAddress,
       );
 
       // Close loading dialog
       Navigator.of(context).pop();
 
-      if (result['success']) {
+      if (result.proofHash.isNotEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Successfully burned $burnAmount XFG to mint $heatAmount Ξmbers'),

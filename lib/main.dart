@@ -30,6 +30,10 @@ void main() {
 
 class XFGWalletApp extends StatelessWidget {
   const XFGWalletApp({super.key});
+}
+
+// Alias for backward compatibility
+typedef FuegoWalletApp = XFGWalletApp;
 
   @override
   Widget build(BuildContext context) {

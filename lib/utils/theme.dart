@@ -129,7 +129,7 @@ class AppTheme {
         type: BottomNavigationBarType.fixed,
         elevation: 8,
       ),
-      tabBarTheme: const TabBarTheme(
+      tabBarTheme: const TabBarThemeData(
         labelColor: primaryColor,
         unselectedLabelColor: textMuted,
         indicatorColor: primaryColor,
@@ -277,4 +277,5 @@ class AppTheme {
       offset: Offset(0, 2),
     ),
   ];
+}];
 }
