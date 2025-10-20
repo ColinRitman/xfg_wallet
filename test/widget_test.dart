@@ -10,8 +10,8 @@ void main() {
     // Build our app and trigger a frame.
     await tester.pumpWidget(const XFGWalletApp());
 
-    // Wait for the typewriter animation to complete (approximately 2 seconds for the text)
-    await tester.pump(const Duration(seconds: 3));
+    // Wait for the typewriter animation to complete but before navigation (1.5 seconds)
+    await tester.pump(const Duration(milliseconds: 1500));
 
     // Verify that our app starts with the splash screen
     expect(find.text('Fyrefly XF₲_wallet'), findsOneWidget);
