@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../models/wallet.dart';
+import '../models/transaction_model.dart';
 
 class WalletService {
   static const String _baseUrl = 'https://api.fuego.org';

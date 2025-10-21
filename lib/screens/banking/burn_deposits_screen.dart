@@ -28,7 +28,7 @@ class _BurnDepositsScreenState extends State<BurnDepositsScreen> {
   Future<void> _fetchLastBurnTransaction() async {
     try {
       // Fetch the last burn transaction from wallet history
-      final List<TransactionModel> transactions = await WalletService.getTransactions();
+      final List<TransactionModel> transactions = await WalletService.getTransactions('default_address');
       final burnTransactions = transactions.where((tx) => tx.isBurnTransaction).toList();
       
       if (burnTransactions.isNotEmpty) {
