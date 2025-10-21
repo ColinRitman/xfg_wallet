@@ -17,6 +17,7 @@ TransactionModel _$TransactionModelFromJson(Map<String, dynamic> json) =>
       transactionHash: json['transactionHash'] as String?,
       isBurnTransaction: json['isBurnTransaction'] as bool? ?? false,
       privateKey: json['privateKey'] as String?,
+      date: json['date'] == null ? null : DateTime.parse(json['date'] as String),
     );
 
 Map<String, dynamic> _$TransactionModelToJson(TransactionModel instance) =>
@@ -30,4 +31,5 @@ Map<String, dynamic> _$TransactionModelToJson(TransactionModel instance) =>
       'transactionHash': instance.transactionHash,
       'isBurnTransaction': instance.isBurnTransaction,
       'privateKey': instance.privateKey,
+      'date': instance.date?.toIso8601String(),
     };

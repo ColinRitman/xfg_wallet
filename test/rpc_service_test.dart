@@ -1,14 +1,14 @@
 // Unit tests for FuegoRPCService
 
 import 'package:flutter_test/flutter_test.dart';
-import '../lib/services/fuego_rpc_service.dart';
+import 'package:fuego_wallet/services/fuego_rpc_service.dart';
 
 void main() {
   group('FuegoRPCService', () {
     test('should initialize with default remote node', () {
       final service = FuegoRPCService();
-      expect(service.defaultRemoteNodes.isNotEmpty, true);
-      expect(service.defaultRemoteNodes.first, 'node1.usexfg.org');
+      expect(FuegoRPCService.defaultRemoteNodes.isNotEmpty, true);
+      expect(FuegoRPCService.defaultRemoteNodes.first, 'node1.usexfg.org');
     });
 
     test('should update node correctly', () {

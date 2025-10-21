@@ -103,4 +103,27 @@ class WalletService {
       rethrow;
     }
   }
+
+  /// Get transactions for burn deposits
+  static Future<List<TransactionModel>> getTransactions(String address) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/transactions/$address'),
+        headers: {'Content-Type': 'application/json'},
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final transactions = List<Map<String, dynamic>>.from(data['transactions']);
+        return transactions.map((json) => TransactionModel.fromJson(json)).toList();
+      } else {
+        throw Exception('Failed to get transactions: ${response.statusCode}');
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error getting transactions: $e');
+      }
+      return [];
+    }
+  }
 }

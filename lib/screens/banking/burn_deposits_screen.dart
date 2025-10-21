@@ -75,7 +75,7 @@ class _BurnDepositsScreenState extends State<BurnDepositsScreen> {
       final int heatTokens = CLIService.calculateHeatTokens(burnAmount);
 
       // Use the last burn transaction's hash
-      final String transactionHash = _lastBurnTransaction!.hash;
+      final String transactionHash = _lastBurnTransaction!.transactionHash ?? 'default_hash';
 
       // Generate burn proof
       final BurnProofResult proofResult = await CLIService.generateBurnProof(
@@ -125,7 +125,7 @@ class _BurnDepositsScreenState extends State<BurnDepositsScreen> {
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
             if (_lastBurnTransaction != null) ...[
-              Text('Transaction Hash: ${_lastBurnTransaction!.hash}'),
+              Text('Transaction Hash: ${_lastBurnTransaction!.transactionHash ?? 'N/A'}'),
               Text('Amount: ${_lastBurnTransaction!.amount} XFG'),
               Text('Date: ${_lastBurnTransaction!.date}'),
             ],
@@ -258,7 +258,7 @@ class _BurnDepositsScreenState extends State<BurnDepositsScreen> {
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            Text('Hash: ${_lastBurnTransaction!.hash}'),
+            Text('Hash: ${_lastBurnTransaction!.transactionHash ?? 'N/A'}'),
             Text('Amount: ${_lastBurnTransaction!.amount} XFG'),
             Text('Date: ${_lastBurnTransaction!.date}'),
           ],

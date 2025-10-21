@@ -84,7 +84,7 @@ class _BankingScreenState extends State<BankingScreen>
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Burn failed: ${result['error']}'),
+            content: Text('Burn failed: Unable to generate proof'),
             backgroundColor: Colors.red,
           ),
         );

@@ -13,6 +13,7 @@ class TransactionModel {
   final String? transactionHash;
   final bool isBurnTransaction;
   final String? privateKey;
+  final DateTime? date;
 
   const TransactionModel({
     required this.id,
@@ -24,6 +25,7 @@ class TransactionModel {
     this.transactionHash,
     this.isBurnTransaction = false,
     this.privateKey,
+    this.date,
   });
 
   factory TransactionModel.fromJson(Map<String, dynamic> json) =>
@@ -41,6 +43,7 @@ class TransactionModel {
     String? transactionHash,
     bool? isBurnTransaction,
     String? privateKey,
+    DateTime? date,
   }) {
     return TransactionModel(
       id: id ?? this.id,
@@ -52,6 +55,7 @@ class TransactionModel {
       transactionHash: transactionHash ?? this.transactionHash,
       isBurnTransaction: isBurnTransaction ?? this.isBurnTransaction,
       privateKey: privateKey ?? this.privateKey,
+      date: date ?? this.date,
     );
   }
 

@@ -277,5 +277,4 @@ class AppTheme {
       offset: Offset(0, 2),
     ),
   ];
-}];
 }
