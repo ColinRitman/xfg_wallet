@@ -1,5 +1,51 @@
 # CHANGELOG.agent.md
 
+## [2026-10-09] Verify the unifyd auth path live; stop live E2E tests reddening ctest
+
+The two preceding commits shipped compile-verified but never *executed* auth.
+The link failure that prevented any execution was not a code defect: the local
+CMake cache predated `PriceWorker.cpp`, `CoinGeckoFeed.cpp` and
+`PricePolicy.cpp`, so ninja never compiled them and the archive was missing 8
+symbols. Re-running `cmake` in `fuego-suite/build` fixed it; `fuegod` and
+`unifyd` now link. No source change was needed for that.
+
+Live verification of the unifyd bearer token, against a running server:
+
+| Request | Expected | Result |
+|---------|----------|--------|
+| no `Authorization` header | 401 | 401 |
+| wrong token | 401 | 401 |
+| correct token | 200 | 200 |
+| correct token + 256 junk bytes | 401 | 401 |
+| lowercase `bearer` scheme | 200 | 200 |
+| lowercase header name | 200 | 200 |
+
+The fourth row is the regression test for the length-truncation bypass found by
+the second adversarial review; it is fixed on both the Rust and C++ sides. The
+last two cover the header-casing defect that would otherwise have rejected every
+valid request, because `HttpParser` lowercases header names on the wire.
+
+Owner-only enforcement on the token file was also exercised: a 0644 file is
+refused at startup with `auth-token-file must be a regular owner-only file`.
+
+CTest: the two live end-to-end tests (`test_sol_e2e`, `test_xmr_live_e2e`) drive a
+real node with real credentials — a Solana sender secret, a monerod +
+monero-wallet-rpc pair — so a bare `ctest` run could never make them pass. They
+printed a usage message and failed on every run, which made the suite permanently
+red for two unsatisfiable tests. They now carry the `live` label and are disabled
+by default; run them with `ctest -L live` once credentials are supplied.
+
+| Gate | Result | Evidence |
+|------|--------|----------|
+| C++ build | PASS | `ninja` all targets clean |
+| C++ tests | PASS | `ctest` — 48/48 passed (2 live tests disabled by label) |
+| unifyd auth, live | PASS | 6/6 cases above, run against a listening server |
+| unifyd + fuegod link | PASS | both produce arm64 Mach-O executables |
+
+**Sign-off:** space-bunny-free — 2026-10-09
+
+---
+
 ## [2026-10-09] Audit fixes 1-3: alias networkId, pre-v11 mint overflow, walletd token
 
 Fixes three findings from the 12-item audit in `AUDIT_STATUS.md`, after a
