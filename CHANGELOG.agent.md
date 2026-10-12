@@ -1,5 +1,53 @@
 # CHANGELOG.agent.md
 
+## [2026-10-11] Cover the changed consensus rules with tests that fail on the old code
+
+Asked where the unregistered consensus test files came from. `ChaingenMain.cpp`
+and the sixteen `tests/CoreTests/*.cpp` files are the inherited upstream
+CryptoNote/Monero/Firo `Chaingen` harness; they arrived in the root import
+commit `a36eccb5b` and were never wired into a build target. The Fuego-specific
+invariants were added separately as gtests in `tests/UnitTests/`, and those *are*
+registered — six gtest binaries plus the daemon targets, the 50 tests that pass.
+So the dead suite is legacy lineage, not lost Fuego coverage.
+
+That mattered, because it showed the real gap: none of the three consensus rules
+this branch changed had a test anywhere. `subAssetChecked`, `xfgShortOf`,
+`addAssetChecked` and the `AssetBalance.overflow` flag appeared in no test file
+in the tree; neither did alias network-id validation or the tag-offset extra
+parsing. The diff was unguarded.
+
+Added `tests/UnitTests/AssetArithmeticOverflowTest.cpp` (9 cases, registered in
+`tests/CMakeLists.txt` as `asset_arithmetic_tests`) because that directory is
+built, rather than resurrecting a sixteen-file harness that has never compiled.
+
+Each guard was mutation-checked — the source was edited back to the pre-fix
+wrapping form and the matching test confirmed to fail, with the equivalence
+tests still passing, then restored:
+
+| Mutation | Result |
+|----------|--------|
+| `xfgShortOf` → `in < (out + fee)` | `xfgShortOf_does_not_wrap_when_out_near_max` FAILS, other two pass |
+| `subAssetChecked` → bare `-=` | `sub_rejects_underflow_instead_of_wrapping` FAILS, equivalence test passes |
+
+The `validateNetworkId32` test asserts its own premise first — that the high 32
+bits of the network id are non-zero — because that is precisely what made the
+old 64-bit equality check reject every alias registration.
+
+Not covered by this change: the alias tag-offset extra parsing (item 1) needs a
+serialized-extra fixture and the `TransactionExtra` walk, which is a larger
+harness than the arithmetic rules; it stays open.
+
+| Gate | Result | Evidence |
+|------|--------|----------|
+| C++ build | PASS | `ninja` clean |
+| C++ tests | PASS | `ctest` — 49/49 (48 prior + asset_arithmetic_tests; 2 live disabled) |
+| Mutation check | PASS | both guards fail on the pre-fix form, restore verified clean |
+| Rust / Dart / Flutter | PASS | 31/31, `dart analyze` 0, `flutter test` 80/80 |
+
+**Sign-off:** space-bunny-free — 2026-10-11
+
+---
+
 ## [2026-10-09] Verify the unifyd auth path live; stop live E2E tests reddening ctest
 
 The two preceding commits shipped compile-verified but never *executed* auth.
