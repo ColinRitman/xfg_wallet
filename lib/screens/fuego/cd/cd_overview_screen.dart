@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import '../../../bloc/cd/cd_cubit.dart';
 import '../../../models/cd.dart';
+import '../../../services/fuego_rpc_service.dart';
 import '../../../utils/theme.dart';
 import 'create_cd_dialog.dart';
 import '../../../utils/xfg_ticker.dart';
@@ -403,7 +404,8 @@ class _MarketRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final daysRemaining = (listing.blocksRemaining / 1440).floor();
+    final config = context.read<FuegoRPCService>().networkConfig;
+    final daysRemaining = (listing.blocksRemaining * config.blockTimeSec / 86400).floor();
 
     return InkWell(
       onTap: () => context.read<CdCubit>().buyCd(listing.listingId),
@@ -556,7 +558,8 @@ class _UserCdCard extends StatelessWidget {
     final blocksLeft = cd.blocksToMaturity;
     final totalBlocks = cd.maturityHeight - cd.depositHeight;
     final progress = totalBlocks > 0 ? 1.0 - (blocksLeft / totalBlocks) : 0.0;
-    final daysLeft = (blocksLeft / 1440).floor();
+    final config = context.read<FuegoRPCService>().networkConfig;
+    final daysLeft = (blocksLeft * config.blockTimeSec / 86400).floor();
 
     return Card(
       color: AppTheme.cardColor,
@@ -724,7 +727,8 @@ class _UserCdCard extends StatelessWidget {
   /// new CD with a selectable term product (6/18/36/72). 8 HEAT CDs auto-roll
   /// and only offer withdraw.
   void _rollover(BuildContext context) {
-    final origEpochs = (cd.maturityHeight - cd.depositHeight) ~/ 900;
+    final epochBlocks = context.read<FuegoRPCService>().networkConfig.epochBlocks;
+    final origEpochs = (cd.maturityHeight - cd.depositHeight) ~/ epochBlocks;
     showDialog(
       context: context,
       builder: (ctx) {
@@ -785,7 +789,7 @@ class _UserCdCard extends StatelessWidget {
               ElevatedButton(
                 onPressed: () {
                   Navigator.of(ctx).pop();
-                  final blocks = selectedTerm * 900;
+                  final blocks = selectedTerm * epochBlocks;
                   context.read<CdCubit>().rolloverCd(
                     cdId: cd.cdId,
                     newTerm: blocks,
@@ -843,7 +847,8 @@ class _LadderBuilderDialogState extends State<_LadderBuilderDialog> {
     try {
       final cubit = context.read<CdCubit>();
       for (final r in _rungs) {
-        final blocks = r.amount == 8.0 ? 900 : r.termEpochs * 900;
+        final epochBlocks = context.read<FuegoRPCService>().networkConfig.epochBlocks;
+        final blocks = r.amount == 8.0 ? epochBlocks : r.termEpochs * epochBlocks;
         await cubit.createCd(
           coin: 'HEAT',
           amount: r.amount.toStringAsFixed(0),
