@@ -823,3 +823,40 @@ build attempted. Recommended next step is a single-method spike (Phase
 - Migrate `AesCbc+HMAC` → `AesGcm`/`XChaCha20-Poly1305` (Crypto MEDIUM)
 - `cargo audit` + `flutter pub audit` + `actions/checkout@SHA` pin + `fuego-suite@tag` verify-commit (Supply Chain)
 - Raise `flutter test` coverage from 2% → 80% (see `PRODUCTION_AUDIT_REPORT.md` timeline)
+
+---
+
+## 2026-10-13 — DeXFG local swap control and deployment hardening
+
+**Started**: 2026-10-13
+**Owner**: Codex
+**Status**: DONE
+
+| # | Task | Owner | Date | Status |
+|---|------|-------|------|--------|
+| 1 | Read the control token from a verified owner-only file for each local daemon request | Codex | 2026-10-13 | DONE |
+| 2 | Restrict daemon control to loopback and require the daemon's exact ready-chain key | Codex | 2026-10-13 | DONE |
+| 3 | Preserve swap amounts and rates with integer decimal conversion through the execution path | Codex | 2026-10-13 | DONE |
+| 4 | Require EVM RPC, chain ID, and HTLC registry data; reject unsupported testnet configuration | Codex | 2026-10-13 | DONE |
+| 5 | Validate decoded Solana program/keypair lengths and serialize XMR spend/view RPC configuration | Codex | 2026-10-13 | DONE |
+| 6 | Add typed confirmations for offer, request, accept, and refund actions | Codex | 2026-10-13 | DONE |
+| 7 | Run focused Flutter tests, static analysis, TUI tests, and daemon build/test targets | Codex | 2026-10-13 | DONE |
+| 8 | Require a control token before any TUI or DeXFG mutation request and correct bare IPv6 loopback URL construction | Codex | 2026-10-14 | DONE |
+| 9 | Match DeXFG AFK counterparty rounding to daemon floor settlement | Codex | 2026-10-14 | DONE |
+| 10 | Restrict SOL configuration to local RPC until authenticated remote transport exists | Codex | 2026-10-14 | DONE |
+
+### Sign-off
+
+| Gate | Result |
+|------|--------|
+| Format | PASS — all task-owned Dart sources and tests formatted |
+| Flutter tests | PASS — client 16/16, configuration 9/9, and pair-drift 13/13 |
+| Flutter analyzer | INFO ONLY — 250 lint messages in the task-owned scope; no errors or warnings emitted |
+| TUI tests and build | PASS — `go test ./...`; `go build -o /private/tmp/fuego-tui-verify .` |
+| Daemon build/tests | PASS — service refuses no token; 13 config checks, 18 state checks, 446 price checks |
+| Funded testnet E2E | NOT RUN — real RPC/deployment metadata and funded accounts were not supplied |
+| All tasks done | DONE — local source gates passed; funded testnet evidence remains separate |
+
+No testnet deployment identifiers, registry addresses, or RPC endpoints were
+invented. The UI refuses a testnet swap configuration without them. The browser
+dashboard remains read-only.

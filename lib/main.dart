@@ -29,6 +29,7 @@ import 'services/fuego_rpc_service.dart';
 import 'services/fuego_vault_service.dart';
 import 'services/node_connection.dart';
 import 'services/security_service.dart';
+import 'services/swap_config_service.dart';
 import 'utils/theme.dart';
 import 'utils/xfg_ticker.dart';
 
@@ -351,9 +352,8 @@ class _FuegoAppState extends State<FuegoApp> with WidgetsBindingObserver {
                       expectedNetwork: nodeConnection.networkConfig.isTestnet
                           ? 'testnet'
                           : 'mainnet',
-                      swapDaemonToken:
-                          Platform.environment['XFG_SWAPD_RPC_TOKEN']?.trim() ??
-                          '',
+                      swapDaemonTokenProvider:
+                          SwapConfigService.readControlToken,
                     );
                   }),
                 );
@@ -367,10 +367,8 @@ class _FuegoAppState extends State<FuegoApp> with WidgetsBindingObserver {
                         expectedNetwork: nodeConnection.networkConfig.isTestnet
                             ? 'testnet'
                             : 'mainnet',
-                        swapDaemonToken:
-                            Platform.environment['XFG_SWAPD_RPC_TOKEN']
-                                ?.trim() ??
-                            '',
+                        swapDaemonTokenProvider:
+                            SwapConfigService.readControlToken,
                       ),
                     );
                   }

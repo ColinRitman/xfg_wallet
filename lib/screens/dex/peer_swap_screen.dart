@@ -52,6 +52,7 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
         if (!mounted) {
           return;
         }
+        unawaited(context.read<DexCubit>().refreshSwapDaemon());
         try {
           SwapNotificationService.init(daemonManager.eventBus, context);
         } catch (_) {}
@@ -69,7 +70,7 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
     super.dispose();
   }
 
-  void _initiateSwap(DexState state) {
+  Future<void> _initiateSwap(DexState state) async {
     final chain = state.selectedSwapChain;
     if (chain == null || !chain.executable) {
       setState(() => _formError = 'Select a ready swap chain');
@@ -85,8 +86,15 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
       );
       final peer = _peerController.text.trim();
       final peerKey = _peerKeyController.text.trim();
+      final confirmed = await _requireTypedConfirmation(
+        title: 'Initiate swap',
+        details:
+            'Send $xfgAmount atomic XFG for $counterpartyAmount atomic ${chain.ticker} through ${chain.name}?',
+        action: 'Initiate Swap',
+      );
+      if (!confirmed || !mounted) return;
       setState(() => _formError = null);
-      context.read<DexCubit>().initiateCrossChainSwap(
+      await context.read<DexCubit>().initiateCrossChainSwap(
         pair: chain.key,
         xfgAmount: xfgAmount,
         ctrAmount: counterpartyAmount,
@@ -96,6 +104,86 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
     } catch (error) {
       setState(() => _formError = error.toString());
     }
+  }
+
+  Future<void> _acceptSwap(SwapInfo swap) async {
+    if (!await _requireTypedConfirmation(
+      title: 'Accept swap',
+      details: 'Accept swap ${swap.swapId} for ${swap.pairName}?',
+      action: 'Accept',
+    )) {
+      return;
+    }
+    if (mounted) await context.read<DexCubit>().acceptSwap(swap.swapId);
+  }
+
+  Future<void> _refundSwap(SwapInfo swap) async {
+    if (!await _requireTypedConfirmation(
+      title: 'Refund swap',
+      details: 'Trigger the refund path for swap ${swap.swapId}?',
+      action: 'Refund',
+      destructive: true,
+    )) {
+      return;
+    }
+    if (mounted) await context.read<DexCubit>().refundSpvSwap(swap.swapId);
+  }
+
+  Future<bool> _requireTypedConfirmation({
+    required String title,
+    required String details,
+    required String action,
+    bool destructive = false,
+  }) async {
+    final controller = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: AppTheme.cardColor,
+        title: Text(title, style: const TextStyle(color: AppTheme.textPrimary)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              details,
+              style: const TextStyle(color: AppTheme.textSecondary),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Type YES to confirm',
+              style: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+            ),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              textCapitalization: TextCapitalization.characters,
+              decoration: const InputDecoration(hintText: 'YES'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Back'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim() == 'YES'),
+            child: Text(
+              action,
+              style: TextStyle(
+                color: destructive
+                    ? AppTheme.errorColor
+                    : AppTheme.primaryColor,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return confirmed == true;
   }
 
   @override
@@ -555,11 +643,9 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
             swap: swap,
             onTap: () => _showSwapDetail(swap),
             onAccept: swap.state == 'INITIATED'
-                ? () => context.read<DexCubit>().acceptSwap(swap.swapId)
+                ? () => _acceptSwap(swap)
                 : null,
-            onRefund: !swap.isTerminal
-                ? () => context.read<DexCubit>().refundSpvSwap(swap.swapId)
-                : null,
+            onRefund: !swap.isTerminal ? () => _refundSwap(swap) : null,
             onInspect: swap.ctrLockTxId != null && swap.ctrLockTxId!.isNotEmpty
                 ? () => _showSwapDetail(swap)
                 : null,
@@ -604,9 +690,7 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
           if (swap.isFailedCommit) ...[
             FailureCard(
               swap: swap,
-              onRefund: () {
-                context.read<DexCubit>().refundSpvSwap(swap.swapId);
-              },
+              onRefund: () => _refundSwap(swap),
               onRetry: () {
                 context.read<DexCubit>().loadSpvSwaps();
                 ScaffoldMessenger.of(context).showSnackBar(
@@ -1085,9 +1169,9 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
                     children: [
                       if (swap.state == 'INITIATED')
                         ElevatedButton(
-                          onPressed: () {
+                          onPressed: () async {
                             Navigator.pop(ctx);
-                            context.read<DexCubit>().acceptSwap(swap.swapId);
+                            await _acceptSwap(swap);
                           },
                           style: ElevatedButton.styleFrom(
                             backgroundColor: AppTheme.successColor,
@@ -1097,9 +1181,9 @@ class _PeerSwapScreenState extends State<PeerSwapScreen> {
                         ),
                       if (!swap.isTerminal)
                         OutlinedButton(
-                          onPressed: () {
+                          onPressed: () async {
                             Navigator.pop(ctx);
-                            context.read<DexCubit>().refundSpvSwap(swap.swapId);
+                            await _refundSwap(swap);
                           },
                           style: OutlinedButton.styleFrom(
                             foregroundColor: AppTheme.errorColor,

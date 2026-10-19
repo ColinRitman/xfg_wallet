@@ -1,76 +1,192 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fuego/services/swap_config_service.dart';
+import 'package:solana/base58.dart' as solana_base58;
 
 const _privateKey =
     '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+const _registry = '0x1111111111111111111111111111111111111111';
 
 void main() {
   group('SwapConfigService.buildConfig', () {
-    test('translates Plasma wallet key to daemon prefix', () {
+    test('emits a catalog-bound mainnet EVM deployment', () {
       final config = SwapConfigService.buildConfig(
         chains: const {
-          'xpl': SwapChainConfig(
+          'eth': SwapChainConfig(
             wif: _privateKey,
-            rpcUrl: 'https://plasma.example:8545',
+            rpcUrl: 'http://127.0.0.1:8545',
+            chainId: 1,
+            htlcRegistry: _registry,
           ),
         },
+        network: 'mainnet',
       );
 
-      expect(config['plasma_mode'], 'rpc');
-      expect(config['plasma_priv_key'], _privateKey);
-      expect(config['plasma_rpc_host'], 'plasma.example');
-      expect(config['plasma_rpc_port'], 8545);
-      expect(config['plasma_chain_id'], 9745);
-      expect(config, isNot(contains('xpl_priv_key')));
+      final chains = config['evm_chains'] as Map<String, dynamic>;
+      final eth = chains['eth'] as Map<String, dynamic>;
+      expect(config['network'], 'mainnet');
+      expect(eth['rpc_url'], 'http://127.0.0.1:8545');
+      expect(eth['chain_id'], 1);
+      expect(eth['htlc_registry'], _registry);
+      expect(eth['private_key'], _privateKey);
+      expect(eth['address'], startsWith('0x'));
     });
 
-    test('translates PulseChain wallet key to daemon prefix', () {
+    test('requires an explicit testnet EVM chain ID', () {
       final config = SwapConfigService.buildConfig(
         chains: const {
-          'pls': SwapChainConfig(
+          'eth': SwapChainConfig(
             wif: _privateKey,
-            rpcUrl: 'https://pulse.example:8545',
+            rpcUrl: 'http://127.0.0.1:8545',
+            chainId: 11155111,
+            htlcRegistry: _registry,
           ),
         },
+        network: 'testnet',
       );
 
-      expect(config['pulsex_mode'], 'rpc');
-      expect(config['pulsex_priv_key'], _privateKey);
-      expect(config['pulsex_rpc_host'], 'pulse.example');
-      expect(config['pulsex_rpc_port'], 8545);
-      expect(config['pulsex_chain_id'], 369);
-      expect(config, isNot(contains('pls_priv_key')));
+      final chains = config['evm_chains'] as Map<String, dynamic>;
+      expect((chains['eth'] as Map<String, dynamic>)['chain_id'], 11155111);
     });
 
-    test('uses generated Monad mainnet chain ID', () {
-      final config = SwapConfigService.buildConfig(
-        chains: const {
-          'monad': SwapChainConfig(
-            wif: _privateKey,
-            rpcUrl: 'https://monad.example:8545',
-          ),
-        },
+    test('rejects incomplete or non-EVM testnet configurations', () {
+      expect(
+        () => SwapConfigService.buildConfig(
+          chains: const {
+            'eth': SwapChainConfig(
+              wif: _privateKey,
+              rpcUrl: 'http://127.0.0.1:8545',
+              htlcRegistry: _registry,
+            ),
+          },
+          network: 'testnet',
+        ),
+        throwsArgumentError,
       );
-
-      expect(config['monad_chain_id'], 143);
-      expect(config['monad_chain_id'], isNot(185));
+      expect(
+        () => SwapConfigService.buildConfig(
+          chains: const {'btc': SwapChainConfig(wif: _privateKey)},
+          network: 'testnet',
+        ),
+        throwsArgumentError,
+      );
     });
 
-    test('keeps daemon-native prefixes and includes metadata chain ID', () {
+    test('serializes Solana deployment and keypair fields', () {
+      final solProgramId = solana_base58.base58encode(List<int>.filled(32, 1));
+      final solKeypair = solana_base58.base58encode(
+        List<int>.generate(64, (index) => index + 1),
+      );
       final config = SwapConfigService.buildConfig(
-        chains: const {
-          'op': SwapChainConfig(
-            wif: _privateKey,
-            rpcUrl: 'https://optimism.example:8545',
+        chains: {
+          'sol': SwapChainConfig(
+            wif: solKeypair,
+            rpcUrl: 'http://127.0.0.1:8899',
+            solProgramId: solProgramId,
           ),
         },
-        xfgSecretKey: 'xfg-secret',
+        network: 'mainnet',
       );
 
-      expect(config['op_mode'], 'rpc');
-      expect(config['op_priv_key'], _privateKey);
-      expect(config['op_chain_id'], 10);
-      expect(config['xfg_secret_key'], 'xfg-secret');
+      expect(config['sol_rpc_host'], '127.0.0.1');
+      expect(config['sol_rpc_port'], 8899);
+      expect(config['sol_program_id'], solProgramId);
+      expect(config['sol_keypair'], solKeypair);
+    });
+
+    test('rejects nonlocal Solana RPC endpoints', () {
+      final solProgramId = solana_base58.base58encode(List<int>.filled(32, 1));
+      final solKeypair = solana_base58.base58encode(
+        List<int>.generate(64, (index) => index + 1),
+      );
+
+      expect(
+        () => SwapConfigService.buildConfig(
+          chains: {
+            'sol': SwapChainConfig(
+              wif: solKeypair,
+              rpcUrl: 'https://api.mainnet-beta.solana.com',
+              solProgramId: solProgramId,
+            ),
+          },
+          network: 'mainnet',
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects Base58 Solana values with the wrong decoded length', () {
+      final shortProgramId = solana_base58.base58encode(
+        List<int>.filled(31, 1),
+      );
+      final shortKeypair = solana_base58.base58encode(List<int>.filled(63, 1));
+
+      expect(
+        () => SwapConfigService.buildConfig(
+          chains: {
+            'sol': SwapChainConfig(
+              wif: shortKeypair,
+              rpcUrl: 'http://127.0.0.1:8899',
+              solProgramId: shortProgramId,
+            ),
+          },
+          network: 'mainnet',
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects a mainnet EVM chain ID outside the catalog', () {
+      expect(
+        () => SwapConfigService.buildConfig(
+          chains: const {
+            'eth': SwapChainConfig(
+              wif: _privateKey,
+              rpcUrl: 'http://127.0.0.1:8545',
+              chainId: 2,
+              htlcRegistry: _registry,
+            ),
+          },
+          network: 'mainnet',
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('serializes Monero daemon and wallet credentials', () {
+      final config = SwapConfigService.buildConfig(
+        chains: const {
+          'xmr': SwapChainConfig(
+            wif: _privateKey,
+            xmrViewKey: _privateKey,
+            xmrDaemonHost: '127.0.0.1',
+            xmrWalletHost: '127.0.0.1',
+          ),
+        },
+        network: 'mainnet',
+      );
+
+      expect(config['xmr_daemon_host'], '127.0.0.1');
+      expect(config['xmr_wallet_host'], '127.0.0.1');
+      expect(config['xmr_spend_key'], _privateKey);
+      expect(config['xmr_view_key'], _privateKey);
+    });
+
+    test('rejects invalid XFG secret keys', () {
+      expect(
+        () => SwapConfigService.buildConfig(
+          chains: const {
+            'op': SwapChainConfig(
+              wif: _privateKey,
+              rpcUrl: 'http://127.0.0.1:8545',
+              chainId: 10,
+              htlcRegistry: _registry,
+            ),
+          },
+          network: 'mainnet',
+          xfgSecretKey: 'not-a-secret-key',
+        ),
+        throwsArgumentError,
+      );
     });
   });
 }

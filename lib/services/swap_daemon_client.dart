@@ -6,15 +6,19 @@ import '../models/swap_models.dart';
 const int _maxRpcResponseBytes = 4 * 1024 * 1024;
 const int _xfgDecimals = 7;
 
+typedef SwapTokenProvider = Future<String> Function();
+
+bool _isLoopbackHost(String value) {
+  final host = value.trim().toLowerCase();
+  return host == '127.0.0.1' || host == '::1' || host == '[::1]';
+}
+
 BigInt _atomicAmountToBigInt(dynamic value) {
   if (value == null) return BigInt.zero;
   if (value is BigInt) return value;
   if (value is int) return BigInt.from(value);
-  if (value is num) return BigInt.from(value.toInt());
-  if (value is String) {
-    final text = value.trim();
-    if (text.isEmpty) return BigInt.zero;
-    return BigInt.parse(text);
+  if (value is String && RegExp(r'^[0-9]+$').hasMatch(value)) {
+    return BigInt.parse(value);
   }
   throw FormatException('Invalid atomic amount: $value');
 }
@@ -104,6 +108,7 @@ class SwapDaemonClient {
   final int port;
   final String expectedNetwork;
   final String token;
+  final SwapTokenProvider? tokenProvider;
   final http.Client _httpClient;
   final bool _ownsHttpClient;
 
@@ -112,11 +117,57 @@ class SwapDaemonClient {
     this.port = 18902,
     required this.expectedNetwork,
     this.token = '',
+    this.tokenProvider,
     http.Client? httpClient,
   }) : _httpClient = httpClient ?? http.Client(),
-       _ownsHttpClient = httpClient == null;
+       _ownsHttpClient = httpClient == null {
+    if (!_isLoopbackHost(host)) {
+      throw ArgumentError.value(
+        host,
+        'host',
+        'swap control RPC must be loopback-only',
+      );
+    }
+    if (token.isNotEmpty && tokenProvider != null) {
+      throw ArgumentError(
+        'provide a control token or token provider, not both',
+      );
+    }
+  }
 
-  String get _baseUrl => 'http://$host:$port';
+  String get _baseUrl {
+    final authorityHost = host == '::1' ? '[::1]' : host;
+    return 'http://$authorityHost:$port';
+  }
+
+  static String validateControlToken(String value) {
+    final token = value.replaceFirst(RegExp(r'[\r\n]+$'), '');
+    if (token.length < 32 || token.length > 256) {
+      throw const FormatException(
+        'Swap daemon control token must contain 32 to 256 characters',
+      );
+    }
+    if (!RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(token)) {
+      throw const FormatException(
+        'Swap daemon control token contains an invalid character',
+      );
+    }
+    return token;
+  }
+
+  Future<String> _controlToken() async {
+    final value = tokenProvider == null ? token : await tokenProvider!();
+    return value.isEmpty ? '' : validateControlToken(value);
+  }
+
+  Future<void> _requireControlTokenForMutation() async {
+    if ((await _controlToken()).isEmpty) {
+      throw SwapRpcException(
+        'Swap daemon control token is required for mutations',
+        -1,
+      );
+    }
+  }
 
   void dispose() {
     if (_ownsHttpClient) _httpClient.close();
@@ -147,6 +198,13 @@ class SwapDaemonClient {
     Map<String, dynamic>? params,
     bool mutation = false,
   ]) async {
+    final controlToken = await _controlToken();
+    if (mutation && controlToken.isEmpty) {
+      throw SwapRpcException(
+        'Swap daemon control token is required for mutations',
+        -1,
+      );
+    }
     try {
       final request = http.Request('POST', Uri.parse('$_baseUrl/'))
         ..followRedirects = false
@@ -157,7 +215,9 @@ class SwapDaemonClient {
           'method': method,
           'params': params ?? const <String, dynamic>{},
         });
-      if (token.isNotEmpty) request.headers['X-Swap-Token'] = token;
+      if (controlToken.isNotEmpty) {
+        request.headers['X-Swap-Token'] = controlToken;
+      }
 
       final response = await _httpClient
           .send(request)
@@ -225,11 +285,14 @@ class SwapDaemonClient {
     return chains;
   }
 
+  Future<List<SwapChain>> listReadyChains() async => (await listChains())
+      .where((chain) => chain.executable)
+      .toList(growable: false);
+
   Future<SwapChain> _requireReadyChain(String pair) async {
     final chains = await listChains();
     for (final chain in chains) {
-      if (chain.key.toLowerCase() == pair.toLowerCase() ||
-          chain.symbol.toLowerCase() == pair.toLowerCase()) {
+      if (chain.key == pair) {
         if (!chain.configured || !chain.ready) {
           final detail = chain.readinessError.isEmpty
               ? 'adapter is not configured and ready'
@@ -242,7 +305,66 @@ class SwapDaemonClient {
     throw SwapRpcException('Unknown protocol chain: $pair', -1);
   }
 
-  Future<String> initiateSwap({
+  Future<String> initiatePeerSwap({
+    required String pair,
+    required String xfgAmount,
+    required String ctrAmount,
+    required String peer,
+    required String expectedPeerPubkey,
+    String role = 'alice',
+    bool requirePtlc = false,
+  }) => _initiateSwap(
+    pair: pair,
+    xfgAmount: xfgAmount,
+    ctrAmount: ctrAmount,
+    peer: peer,
+    role: role,
+    expectedPeerPubkey: expectedPeerPubkey,
+    requirePtlc: requirePtlc,
+  );
+
+  Future<String> initiateAfkSwap({
+    required String pair,
+    required String xfgAmount,
+    required String ctrAmount,
+    required String peer,
+    required String expectedPeerPubkey,
+    required String swapId,
+    required String ourSwapSecretKey,
+    required String adaptorPoint,
+    required String hashLock,
+    required String preSig,
+    required String ctrAddress,
+    bool requirePtlc = false,
+  }) {
+    if (swapId.isEmpty ||
+        ourSwapSecretKey.isEmpty ||
+        adaptorPoint.isEmpty ||
+        hashLock.isEmpty ||
+        preSig.isEmpty) {
+      throw const FormatException(
+        'AFK swap is missing maker-bound lock material',
+      );
+    }
+    return _initiateSwap(
+      pair: pair,
+      xfgAmount: xfgAmount,
+      ctrAmount: ctrAmount,
+      peer: peer,
+      role: 'alice',
+      expectedPeerPubkey: expectedPeerPubkey,
+      swapId: swapId,
+      ourSwapSecretKey: ourSwapSecretKey,
+      afk: true,
+      adaptorPoint: adaptorPoint,
+      hashLock: hashLock,
+      preSig: preSig,
+      ctrAddress: ctrAddress,
+      requirePtlc: requirePtlc,
+    );
+  }
+
+  Future<String> _initiateSwap({
     required String pair,
     required String xfgAmount,
     required String ctrAmount,
@@ -260,6 +382,7 @@ class SwapDaemonClient {
     String? ptlcPoint,
     int? lockType,
   }) async {
+    await _requireControlTokenForMutation();
     await _requireReadyChain(pair);
     _validateAtomicAmount(xfgAmount, _maxUint64, 'XFG amount');
     _validateAtomicAmount(ctrAmount, _maxUint256, 'Counterparty amount');
@@ -301,6 +424,7 @@ class SwapDaemonClient {
 
   Future<Map<String, dynamic>> acceptSwap(String swapId) async {
     _validateSwapId(swapId);
+    await _requireControlTokenForMutation();
     await verifyContext();
     final result =
         await _rpc('accept', {'swap_id': swapId}, true) as Map<String, dynamic>;
@@ -340,6 +464,7 @@ class SwapDaemonClient {
 
   Future<bool> refund(String swapId) async {
     _validateSwapId(swapId);
+    await _requireControlTokenForMutation();
     await verifyContext();
     final result =
         await _rpc('refund', {'swap_id': swapId}, true) as Map<String, dynamic>;
@@ -347,6 +472,7 @@ class SwapDaemonClient {
   }
 
   Future<TimeoutResult> checkTimeouts() async {
+    await _requireControlTokenForMutation();
     await verifyContext();
     final result =
         await _rpc('check_timeouts', const <String, dynamic>{}, true)
@@ -384,6 +510,46 @@ class SwapDaemonClient {
 
   static String counterpartyToAtomic(String text, int decimals) =>
       decimalToAtomic(text, decimals, maximum: _maxUint256);
+
+  static String counterpartyAmountForOffer({
+    required int xfgAmount,
+    required int rateNum,
+    required int counterpartyDecimals,
+  }) {
+    if (xfgAmount <= 0 || rateNum <= 0 || counterpartyDecimals < 0) {
+      throw const FormatException('Offer contains an invalid amount or rate');
+    }
+    final numerator =
+        BigInt.from(xfgAmount) * BigInt.from(10).pow(counterpartyDecimals);
+    final counterpartyAmount = numerator ~/ BigInt.from(rateNum);
+    if (counterpartyAmount <= BigInt.zero) {
+      throw const FormatException('Offer counterparty amount is zero');
+    }
+    return counterpartyAmount.toString();
+  }
+
+  static int counterpartyPerXfgToRateNum(String text) {
+    if (text.trim() != text) {
+      throw const FormatException('Invalid decimal rate');
+    }
+    final match = RegExp(r'^(0|[1-9][0-9]*)(?:\.([0-9]+))?$').firstMatch(text);
+    if (match == null) throw const FormatException('Invalid decimal rate');
+    final fraction = match.group(2) ?? '';
+    final numerator = BigInt.parse('${match.group(1)}$fraction');
+    if (numerator <= BigInt.zero) {
+      throw const FormatException('Rate must be greater than zero');
+    }
+    final decimalScale = BigInt.from(10).pow(fraction.length);
+    final scaled = BigInt.from(10).pow(_xfgDecimals) * decimalScale;
+    var rateNum = scaled ~/ numerator;
+    if ((scaled % numerator) * BigInt.from(2) >= numerator) {
+      rateNum += BigInt.one;
+    }
+    if (rateNum <= BigInt.zero || rateNum > _maxUint64) {
+      throw const FormatException('Rate is outside the protocol range');
+    }
+    return rateNum.toInt();
+  }
 
   static void _validateAtomicAmount(
     String value,
