@@ -11,6 +11,8 @@ use tokio::sync::Mutex;
 
 use crate::wallet_service::WalletService;
 use crate::wallet_slot::WalletSlot;
+use fuego_sdk::chain::{BitcoinChain, ChainSpv, ChainType, EvmChain, PaymentProof};
+use fuego_sdk::Wallet;
 use zeroize::Zeroize;
 
 pub struct AppState {
@@ -71,7 +73,7 @@ fn is_fuegod_method(method: &str) -> bool {
         "get_orderbook_state" | "get_orderbook_info" | "get_orderbook_estimates" |
         "get_fuego_price" | "getswapoffers" | "getswapprice" | "getswaptrades" |
         "submitswap" | "cancelswap" | "requestswap" |
-        "getactiveswaps" | "getswapstatus" | "verify_payment" | "htlc_create_hash_lock" | "htlc_build_script" |
+        "getactiveswaps" | "getswapstatus" | "htlc_create_hash_lock" | "htlc_build_script" |
         "initiate" | "accept" | "processswap" | "refundswap" |
         "getdeposits" | "get_block_range" | "get_maturing_deposits" |
         "rollover_deposit" | "get_fee_pool_info" | "get_epoch_history" |
@@ -208,7 +210,7 @@ async fn proxy_to_fuegod(fuegod_url: &str, body: &serde_json::Value) -> Result<s
         "getcdoffers" | "submitcd" | "cancelcd" | "estimate_cd_yield" |
         "getswapoffers" | "getswapprice" | "getswaptrades" |
         "submitswap" | "cancelswap" | "requestswap" |
-        "getactiveswaps" | "getswapstatus" | "verify_payment" | "htlc_create_hash_lock" | "htlc_build_script" |
+        "getactiveswaps" | "getswapstatus" | "htlc_create_hash_lock" | "htlc_build_script" |
         "initiate" | "accept" | "processswap" | "refundswap" |
         "getdeposits" | "get_block_range" | "get_maturing_deposits" |
         "rollover_deposit" | "get_fee_pool_info" | "get_epoch_history" |
@@ -597,6 +599,15 @@ async fn handle_wallet_method(
                 "transactionHash": tx_hash,
                 "txHash": tx_hash,
             }))
+        }
+        // SPV payment verification. Handled here, never proxied: fuegod has no
+        // such endpoint, so the proof is built and verified by the SDK's chain
+        // adapters. Needs no open wallet — the wallet plays no part in a
+        // foreign-chain query.
+        "verify_payment" => {
+            let req: VerifyPaymentRequest = serde_json::from_value(params.clone())
+                .map_err(|e| format!("invalid verify_payment params: {e}"))?;
+            verify_payment_impl(&req).await
         }
         "swap" => {
             let direction_raw = params.get("direction")
@@ -1131,6 +1142,162 @@ async fn scan_balance_handler(
     .into_response()
 }
 
+// ── SPV payment verification ─────────────────────────────────────────────
+
+/// POST /verify_payment — build and verify a payment proof on a foreign chain.
+///
+/// walletd's own handler, not a proxy arm: fuegod has no `/verify_payment`
+/// endpoint, so the SDK's chain adapters do the work. The response body is the
+/// proof map the Dart `PaymentProofSdk.fromJson` parses.
+#[derive(Deserialize)]
+struct VerifyPaymentRequest {
+    /// Chain id — the Dart `ChainTypeSdk` enum discriminant.
+    chain: i64,
+    tx_hash: String,
+    from_address: String,
+    to_address: String,
+    /// Amount in the chain's atomic units (satoshis / wei).
+    amount: u64,
+    #[serde(default = "default_min_confirmations")]
+    min_confirmations: u32,
+}
+
+fn default_min_confirmations() -> u32 {
+    6
+}
+
+/// Map a Dart `ChainTypeSdk` id to the SDK `ChainType`. The two enums declare
+/// their common chains in the same order, so the id is the discriminant.
+fn chain_type_from_id(id: i64) -> Option<ChainType> {
+    Some(match id {
+        0 => ChainType::Fuego,
+        1 => ChainType::Solana,
+        2 => ChainType::Ethereum,
+        3 => ChainType::Monero,
+        4 => ChainType::BitcoinCash,
+        5 => ChainType::Arbitrum,
+        6 => ChainType::Base,
+        7 => ChainType::Komodo,
+        8 => ChainType::Bnb,
+        9 => ChainType::Decred,
+        10 => ChainType::Bitcoin,
+        11 => ChainType::Litecoin,
+        12 => ChainType::Polygon,
+        _ => return None,
+    })
+}
+
+/// The Dart `ChainTypeSdk` id for an SDK chain (see `chain_type_from_id`).
+fn chain_id(chain: ChainType) -> i64 {
+    match chain {
+        ChainType::Fuego => 0,
+        ChainType::Solana => 1,
+        ChainType::Ethereum => 2,
+        ChainType::Monero => 3,
+        ChainType::BitcoinCash => 4,
+        ChainType::Arbitrum => 5,
+        ChainType::Base => 6,
+        ChainType::Komodo => 7,
+        ChainType::Bnb => 8,
+        ChainType::Decred => 9,
+        ChainType::Bitcoin => 10,
+        ChainType::Litecoin => 11,
+        ChainType::Polygon => 12,
+    }
+}
+
+/// The SPV adapter for `chain` against its default RPC endpoint. The
+/// Bitcoin-family defaults are the local bitcoind-style ports the swap
+/// daemon's RPC mode documents; the EVM defaults are the same public
+/// endpoints the swap config uses.
+fn chain_spv_for(chain: ChainType) -> Result<Box<dyn ChainSpv>, String> {
+    let spv: Box<dyn ChainSpv> = match chain {
+        ChainType::Bitcoin => Box::new(BitcoinChain::new(chain, "http://127.0.0.1:8332", "", "")
+            .map_err(|e| e.to_string())?),
+        ChainType::BitcoinCash => Box::new(BitcoinChain::new(chain, "http://127.0.0.1:8332", "", "")
+            .map_err(|e| e.to_string())?),
+        ChainType::Litecoin => Box::new(BitcoinChain::new(chain, "http://127.0.0.1:9332", "", "")
+            .map_err(|e| e.to_string())?),
+        ChainType::Komodo => Box::new(BitcoinChain::new(chain, "http://127.0.0.1:7771", "", "")
+            .map_err(|e| e.to_string())?),
+        ChainType::Decred => Box::new(BitcoinChain::new(chain, "http://127.0.0.1:9108", "", "")
+            .map_err(|e| e.to_string())?),
+        ChainType::Ethereum => Box::new(EvmChain::new(chain, "https://eth.llamarpc.com", 0)
+            .map_err(|e| e.to_string())?),
+        ChainType::Arbitrum => Box::new(EvmChain::new(chain, "https://arb1.arbitrum.io/rpc", 0)
+            .map_err(|e| e.to_string())?),
+        ChainType::Base => Box::new(EvmChain::new(chain, "https://mainnet.base.org", 0)
+            .map_err(|e| e.to_string())?),
+        ChainType::Bnb => Box::new(EvmChain::new(chain, "https://bsc-dataseed.binance.org", 0)
+            .map_err(|e| e.to_string())?),
+        ChainType::Polygon => Box::new(EvmChain::new(chain, "https://polygon-rpc.com", 0)
+            .map_err(|e| e.to_string())?),
+        other => return Err(format!("{} has no SPV verification adapter", other.name())),
+    };
+    Ok(spv)
+}
+
+/// Build and verify the payment proof. Shared by the `/verify_payment` REST
+/// handler and the `verify_payment` JSON-RPC method so both emit exactly what
+/// the Dart side parses.
+async fn verify_payment_impl(req: &VerifyPaymentRequest) -> Result<serde_json::Value, String> {
+    let chain = chain_type_from_id(req.chain)
+        .ok_or_else(|| format!("unsupported chain id {} for SPV verification", req.chain))?;
+    let spv = chain_spv_for(chain)?;
+    let proof = Wallet::verify_payment(
+        &*spv,
+        &req.tx_hash,
+        &req.from_address,
+        &req.to_address,
+        req.amount,
+        req.min_confirmations,
+    )
+    .await
+    .map_err(|e| format!("verify_payment failed: {e}"))?;
+    Ok(payment_proof_json(&proof))
+}
+
+/// Serialize a proof to the field names `PaymentProofSdk.fromJson` parses.
+fn payment_proof_json(proof: &PaymentProof) -> serde_json::Value {
+    serde_json::json!({
+        "chain_id": chain_id(proof.chain),
+        "tx_hash": proof.tx_hash,
+        "amount": proof.amount,
+        "from_address": proof.from_address,
+        "to_address": proof.to_address,
+        "confirmations": proof.confirmations,
+        "block_height": proof.block_height,
+        "block_hash": proof.block_hash,
+        "merkle_root": proof.merkle_root,
+        "merkle_proof": proof.merkle_proof,
+        "tx_index": proof.tx_index,
+        "total_txs": proof.total_txs,
+        "verified": proof.verified,
+    })
+}
+
+async fn verify_payment_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<VerifyPaymentRequest>,
+) -> axum::response::Response {
+    if !is_authorized_host(&headers) {
+        return forbidden();
+    }
+    // Same gate as every other wallet route: a configured bearer token must
+    // be presented. The proof is chain data, so no open wallet is required.
+    if let Some(denied) = require_token(&state, &headers) {
+        return denied;
+    }
+    match verify_payment_impl(&req).await {
+        Ok(val) => Json(val).into_response(),
+        // The failure is the upstream chain RPC's, like the proxy's own.
+        Err(msg) => {
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": msg}))).into_response()
+        }
+    }
+}
+
 pub async fn run_server(
     slot: Arc<WalletSlot>,
     fuegod_url: &str,
@@ -1178,7 +1345,7 @@ pub async fn run_server(
         .route("/requestswap", post(fuegod_post))
         .route("/getactiveswaps", post(fuegod_post))
         .route("/getswapstatus", post(fuegod_post))
-        .route("/verify_payment", post(fuegod_post))
+        .route("/verify_payment", post(verify_payment_handler))
         .route("/htlc_create_hash_lock", post(fuegod_post))
         .route("/htlc_build_script", post(fuegod_post))
         // Extra robustness GET endpoints
@@ -1307,6 +1474,7 @@ mod dispatch_tests {
             ("fuegod_post", "proxied POST"),
             ("status_handler", "address + balance"),
             ("scan_balance_handler", "balance"),
+            ("verify_payment_handler", "SPV payment proof"),
         ] {
             let tail = src
                 .split_once(&format!("async fn {handler}("))
@@ -1389,5 +1557,93 @@ mod dispatch_tests {
         // Names the handler does not implement fall through to the fuegod proxy.
         assert_eq!(call(&wallet, "getinfo", serde_json::json!({})).await.unwrap_err(), NOT_A_WALLET_METHOD);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn verify_payment_params(chain: i64) -> serde_json::Value {
+        serde_json::json!({
+            "chain": chain,
+            "tx_hash": "0xabc",
+            "from_address": "0xfrom",
+            "to_address": "0xto",
+            "amount": 1000,
+            "min_confirmations": 6,
+        })
+    }
+
+    /// verify_payment is walletd's own method: it is dispatched without an
+    /// open wallet (a foreign-chain query needs none) and never falls through
+    /// to the fuegod proxy. Chain 1 (Solana) fails in the adapter lookup,
+    /// before any RPC call, so this runs offline.
+    #[tokio::test]
+    async fn verify_payment_is_a_wallet_method_that_needs_no_open_wallet() {
+        let err = handle_wallet_method(None, "http://127.0.0.1:1", "verify_payment", &verify_payment_params(1))
+            .await
+            .unwrap_err();
+        assert_ne!(err, NOT_A_WALLET_METHOD);
+        assert_ne!(err, NO_WALLET_OPEN);
+        assert!(err.contains("no SPV verification adapter"));
+    }
+
+    /// Missing params are a plain validation error, still not a proxy fallthrough.
+    #[tokio::test]
+    async fn verify_payment_params_are_validated() {
+        let err = handle_wallet_method(None, "http://127.0.0.1:1", "verify_payment", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_ne!(err, NOT_A_WALLET_METHOD);
+        assert_ne!(err, NO_WALLET_OPEN);
+    }
+
+    /// The method must not be allowlisted for the proxy anywhere.
+    #[test]
+    fn verify_payment_is_not_a_fuegod_method() {
+        assert!(!is_fuegod_method("verify_payment"));
+    }
+
+    /// Chain ids round-trip between the Dart enum and the SDK enum, and the
+    /// ids past the SDK's 13 chains are refused.
+    #[test]
+    fn chain_ids_match_the_dart_enum() {
+        for id in 0..=12i64 {
+            assert_eq!(chain_id(chain_type_from_id(id).unwrap()), id);
+        }
+        for id in [13, 22, -1, 100] {
+            assert_eq!(chain_type_from_id(id), None, "id {id}");
+        }
+    }
+
+    /// The proof serializes to the exact field names PaymentProofSdk.fromJson
+    /// parses.
+    #[test]
+    fn payment_proof_serializes_to_the_dart_field_names() {
+        let proof = PaymentProof {
+            chain: ChainType::Ethereum,
+            tx_hash: "0xabc".into(),
+            amount: 123,
+            from_address: "0xfrom".into(),
+            to_address: "0xto".into(),
+            confirmations: 7,
+            block_height: 100,
+            block_hash: "0xblk".into(),
+            verified: true,
+            merkle_root: "0xroot".into(),
+            merkle_proof: vec!["0xsib".into()],
+            tx_index: 3,
+            total_txs: 9,
+        };
+        let json = payment_proof_json(&proof);
+        assert_eq!(json["chain_id"], 2);
+        assert_eq!(json["tx_hash"], "0xabc");
+        assert_eq!(json["amount"], 123);
+        assert_eq!(json["from_address"], "0xfrom");
+        assert_eq!(json["to_address"], "0xto");
+        assert_eq!(json["confirmations"], 7);
+        assert_eq!(json["block_height"], 100);
+        assert_eq!(json["block_hash"], "0xblk");
+        assert_eq!(json["merkle_root"], "0xroot");
+        assert_eq!(json["merkle_proof"], serde_json::json!(["0xsib"]));
+        assert_eq!(json["tx_index"], 3);
+        assert_eq!(json["total_txs"], 9);
+        assert_eq!(json["verified"], true);
     }
 }
