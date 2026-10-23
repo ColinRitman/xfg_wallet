@@ -69,12 +69,12 @@ class WalletdAuth {
   /// reach the chain daemon, which in remote mode is a third-party seed node.
   /// Attaching there would leak the wallet API key off the machine.
   static Interceptor interceptor() => InterceptorsWrapper(
-        onRequest: (options, handler) {
-          final host = options.uri.host;
-          if (host.isNotEmpty) options.headers.addAll(headersForHost(host));
-          handler.next(options);
-        },
-      );
+    onRequest: (options, handler) {
+      final host = options.uri.host;
+      if (host.isNotEmpty) options.headers.addAll(headersForHost(host));
+      handler.next(options);
+    },
+  );
 
   /// A Dio instance that presents the token on every request. Use this instead
   /// of `Dio(...)` in a constructor initializer list, where a cascade is not

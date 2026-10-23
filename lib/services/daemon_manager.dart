@@ -399,7 +399,8 @@ class DaemonManager {
     try {
       final req = await client.getUrl(Uri.parse(url));
       final uri = Uri.parse(url);
-      final loopback = uri.host == '127.0.0.1' ||
+      final loopback =
+          uri.host == '127.0.0.1' ||
           uri.host == 'localhost' ||
           uri.host == '::1';
       final healthToken = WalletdAuth.token;
@@ -965,9 +966,7 @@ class DaemonManager {
     if (alreadyRunning) {
       _walletdExternallyRunning = true;
       _fuegodExternallyRunning = true;
-      debugPrint(
-        '[daemon] Unifyd daemon already running on port $walletdPort',
-      );
+      debugPrint('[daemon] Unifyd daemon already running on port $walletdPort');
       return null;
     }
 
@@ -1142,8 +1141,7 @@ class DaemonManager {
       // Process died — don't keep polling a corpse for 180s.
       if (_unifyd == null) {
         debugPrint('[daemon] unifyd daemon exited during startup');
-        return daemonErrors['unifyd'] ??
-            'unifyd daemon exited during startup';
+        return daemonErrors['unifyd'] ?? 'unifyd daemon exited during startup';
       }
 
       HttpClient? client;

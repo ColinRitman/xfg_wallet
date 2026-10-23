@@ -65,9 +65,9 @@ class CdCubit extends Cubit<CdState> {
       // endpoint and is loaded with the list; if it ever fails the screen falls
       // back to defaults rather than erroring out the user's CDs.
       final listFuture = _rpc.cdList();
-      final apyFuture = _rpc
-          .cdApy()
-          .catchError((Object _) => const CdApyResult.empty());
+      final apyFuture = _rpc.cdApy().catchError(
+        (Object _) => const CdApyResult.empty(),
+      );
       final marketFuture = _rpc.cdMarketList().then<CdMarketListResult>(
         (v) => v,
         onError: (Object _, StackTrace __) => const CdMarketListResult.empty(),
