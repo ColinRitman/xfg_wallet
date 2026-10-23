@@ -1580,14 +1580,14 @@ impl WalletService {
         let mut commitment_dests = vec![BuildCommitmentDestination {
             amount,
             term: term_blocks,
-            view_pub: None,
+            view_pub: keys.view_public,
             spend_pub: keys.spend_public,
         }];
         if heat_change > 0 {
             commitment_dests.push(BuildCommitmentDestination {
                 amount: heat_change,
                 term: HEAT_TERM,
-                view_pub: None,
+                view_pub: keys.view_public,
                 spend_pub: keys.spend_public,
             });
         }
@@ -1829,7 +1829,7 @@ impl WalletService {
         let commitment_dests = vec![BuildCommitmentDestination {
             amount: rolled_amount,
             term: term_blocks,
-            view_pub: None,
+            view_pub: keys.view_public,
             spend_pub: keys.spend_public,
         }];
 
@@ -1908,7 +1908,7 @@ impl WalletService {
         let mut commitment_dests = vec![BuildCommitmentDestination {
             amount,
             term: HEAT_TERM,
-            view_pub: Some(recv_view),
+            view_pub: recv_view,
             // Owner-bound: only the recipient's spend key can authorize this.
             spend_pub: recv_spend,
         }];
@@ -1916,7 +1916,7 @@ impl WalletService {
             commitment_dests.push(BuildCommitmentDestination {
                 amount: change,
                 term: HEAT_TERM,
-                view_pub: None,
+                view_pub: keys.view_public,
                 spend_pub: keys.spend_public,
             });
         }

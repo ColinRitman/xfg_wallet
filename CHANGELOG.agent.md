@@ -1,356 +1,34 @@
 # CHANGELOG.agent.md
 
-## [2026-10-11] Cover the changed consensus rules with tests that fail on the old code
+## [2026-10-04] Merge Colin's owner-bound commitment keys into the audit branch
 
-Asked where the unregistered consensus test files came from. `ChaingenMain.cpp`
-and the sixteen `tests/CoreTests/*.cpp` files are the inherited upstream
-CryptoNote/Monero/Firo `Chaingen` harness; they arrived in the root import
-commit `a36eccb5b` and were never wired into a build target. The Fuego-specific
-invariants were added separately as gtests in `tests/UnitTests/`, and those *are*
-registered — six gtest binaries plus the daemon targets, the 50 tests that pass.
-So the dead suite is legacy lineage, not lost Fuego coverage.
-
-That mattered, because it showed the real gap: none of the three consensus rules
-this branch changed had a test anywhere. `subAssetChecked`, `xfgShortOf`,
-`addAssetChecked` and the `AssetBalance.overflow` flag appeared in no test file
-in the tree; neither did alias network-id validation or the tag-offset extra
-parsing. The diff was unguarded.
-
-Added `tests/UnitTests/AssetArithmeticOverflowTest.cpp` (9 cases, registered in
-`tests/CMakeLists.txt` as `asset_arithmetic_tests`) because that directory is
-built, rather than resurrecting a sixteen-file harness that has never compiled.
-
-Each guard was mutation-checked — the source was edited back to the pre-fix
-wrapping form and the matching test confirmed to fail, with the equivalence
-tests still passing, then restored:
-
-| Mutation | Result |
-|----------|--------|
-| `xfgShortOf` → `in < (out + fee)` | `xfgShortOf_does_not_wrap_when_out_near_max` FAILS, other two pass |
-| `subAssetChecked` → bare `-=` | `sub_rejects_underflow_instead_of_wrapping` FAILS, equivalence test passes |
-
-The `validateNetworkId32` test asserts its own premise first — that the high 32
-bits of the network id are non-zero — because that is precisely what made the
-old 64-bit equality check reject every alias registration.
-
-Not covered by this change: the alias tag-offset extra parsing (item 1) needs a
-serialized-extra fixture and the `TransactionExtra` walk, which is a larger
-harness than the arithmetic rules; it stays open.
-
-| Gate | Result | Evidence |
-|------|--------|----------|
-| C++ build | PASS | `ninja` clean |
-| C++ tests | PASS | `ctest` — 49/49 (48 prior + asset_arithmetic_tests; 2 live disabled) |
-| Mutation check | PASS | both guards fail on the pre-fix form, restore verified clean |
-| Rust / Dart / Flutter | PASS | 31/31, `dart analyze` 0, `flutter test` 80/80 |
-
-**Sign-off:** space-bunny-free — 2026-10-11
-
----
-
-## [2026-10-09] Verify the unifyd auth path live; stop live E2E tests reddening ctest
-
-The two preceding commits shipped compile-verified but never *executed* auth.
-The link failure that prevented any execution was not a code defect: the local
-CMake cache predated `PriceWorker.cpp`, `CoinGeckoFeed.cpp` and
-`PricePolicy.cpp`, so ninja never compiled them and the archive was missing 8
-symbols. Re-running `cmake` in `fuego-suite/build` fixed it; `fuegod` and
-`unifyd` now link. No source change was needed for that.
-
-Live verification of the unifyd bearer token, against a running server:
-
-| Request | Expected | Result |
-|---------|----------|--------|
-| no `Authorization` header | 401 | 401 |
-| wrong token | 401 | 401 |
-| correct token | 200 | 200 |
-| correct token + 256 junk bytes | 401 | 401 |
-| lowercase `bearer` scheme | 200 | 200 |
-| lowercase header name | 200 | 200 |
-
-The fourth row is the regression test for the length-truncation bypass found by
-the second adversarial review; it is fixed on both the Rust and C++ sides. The
-last two cover the header-casing defect that would otherwise have rejected every
-valid request, because `HttpParser` lowercases header names on the wire.
-
-Owner-only enforcement on the token file was also exercised: a 0644 file is
-refused at startup with `auth-token-file must be a regular owner-only file`.
-
-CTest: the two live end-to-end tests (`test_sol_e2e`, `test_xmr_live_e2e`) drive a
-real node with real credentials — a Solana sender secret, a monerod +
-monero-wallet-rpc pair — so a bare `ctest` run could never make them pass. They
-printed a usage message and failed on every run, which made the suite permanently
-red for two unsatisfiable tests. They now carry the `live` label and are disabled
-by default; run them with `ctest -L live` once credentials are supplied.
-
-| Gate | Result | Evidence |
-|------|--------|----------|
-| C++ build | PASS | `ninja` all targets clean |
-| C++ tests | PASS | `ctest` — 48/48 passed (2 live tests disabled by label) |
-| unifyd auth, live | PASS | 6/6 cases above, run against a listening server |
-| unifyd + fuegod link | PASS | both produce arm64 Mach-O executables |
-
-**Sign-off:** space-bunny-free — 2026-10-09
-
----
-
-## [2026-10-09] Audit fixes 1-3: alias networkId, pre-v11 mint overflow, walletd token
-
-Fixes three findings from the 12-item audit in `AUDIT_STATUS.md`, after a
-pre-implementation and a post-implementation adversarial review each. The
-post-implementation review found a live authentication bypass and a credential
-leak in the first draft of the token work; both are fixed here and each has a
-regression test.
-
-**C++ (fuego-suite submodule — needs its own commit and a parent pin bump):**
-
-- `AssetBalance` gained an `overflow` flag. Both accumulators set it when a
-  running sum would wrap, so a wrapped total can never be read as a value.
-- The v10-only branch in `pushBlock` refuses when either balance overflowed, and
-  the HEAT-mint fee arithmetic now uses `addChecked` for `out+burn+fund`, the
-  `out+fee+burn` conservation check, and `in.heat+minted`. Verified bit-identical
-  on every non-overflowing input; the change only differs where the old
-  arithmetic wrapped. No HEAT/Hearth/CD/atomic-swap transaction has ever reached
-  mainnet, so no historical block changes meaning.
-- `Currency::validateNetworkId32` compares the low 32 bits of the network id.
-  The alias extra's `networkId` is a `uint32_t` written as 4 fixed bytes while
-  the chain id is a 64-bit keccak digest, so comparing the zero-extended field
-  against the full digest could never succeed and every alias this chain's own
-  wallets registered was silently dropped from the index. Widening the field
-  was rejected: `write(uint32_t)` emits 4 bytes and `write(uint64_t)` emits 8, so
-  it would change the wire format.
-- The `networkId == 0` "legacy" bypass is removed. The field is the last item in
-  the extra and always written, and a truncated blob fails the strict
-  end-of-stream read, so an extra without it was never parseable — there is no
-  legacy case to grandfather, and accepting 0 was the replay hole the field
-  exists to close. Alias registration never worked on mainnet, so nothing is
-  lost.
-
-**Rust (`fuego_walletd`):**
-
-- `--auth-token-file`; a 256-bit token from the keychain gates
-  `/json_rpc`, the fuegod proxy and `/scan_balance`. Passed by path, never argv.
-  `/health` and `/status` stay reachable for startup probing.
-- `is_authorized_host` refuses a request with no `Host` header (it previously
-  returned true), and parses bracketed IPv6 hosts correctly.
-- `token_matches` compares lengths before the byte loop. The first draft folded
-  the length into the accumulator as `u8`, where `13 ^ 269` truncates to zero —
-  the correct token plus 256 junk bytes authenticated. Reproduced, fixed, and
-  covered by `a_longer_token_with_junk_appended_is_rejected`.
-- `/health` no longer returns the wallet address and balance to an unauthenticated
-  caller; those fields are null without the token while liveness stays open.
-
-**Dart:**
-
-- `WalletdAuth` holds the token. It is sent only to loopback: the same clients
-  also reach the chain daemon, which in remote mode is a third-party seed node,
-  and the first draft posted the wallet API key there on every `getinfo` fallback
-  and HEAT-metrics poll.
-- The readiness probes now send the token. Without it they got 401 from a
-  walletd the app had started itself, so the app judged its own healthy daemon
-  stale and killed it on every relaunch.
-- The token is cleared with the rest of the wallet data.
-
-**`unified` (desktop) now gated too — the largest gap is closed:**
-
-- `JsonRpcServer` gained an opt-in `setBearerToken`, enforced in `processRequest`
-  before any method dispatch. Empty (the default) leaves the server
-  unauthenticated, so the daemon RPC is untouched. `PaymentGateService` opts in
-  from a new `--auth-token-file`.
-- The token file is read with the same hardening as the container password —
-  regular file, owned by the caller, no group/other bits — so another local user
-  cannot substitute their own token.
-- Dart now loads the token and passes `--auth-token-file` in `_startUnified` too.
-  The same `length-first` compare is used here; folding the length into a `u8`
-  accumulator would let the token plus 256 junk bytes through, which is the bug
-  already fixed and regression-tested on the Rust side.
-- `load()` now runs *before* the readiness probes in both spawn paths. After
-  walletd started requiring a token, the probes were getting 401 from the app's
-  own healthy daemon, judging it stale and killing it on every relaunch.
-
-**Remaining defects in the same branch, also fixed:**
-
-- The AMM direction-0 and direction-1 subtractions were unchecked.
-  `inAssets.xfg - outAssets.xfg - xfgFee` wrapping near 2^64 inflates
-  `expectedHeat` until the check trivially passes and HEAT is minted for XFG
-  never paid in; the mirrored `inAssets.heat - outAssets.heat` does the same to
-  XFG. Both now subtract through a checked helper.
-- The four sibling `inAssets.xfg < outAssets.xfg + xfgFee` tests (HEAT send,
-  market buy, market sell, and the general case) shared the same wrap: an `out`
-  near 2^64 wraps the add, the guard reads false, and an unbalanced transaction
-  is accepted. They now use a comparison helper that never adds.
-- `Core.cpp` computed the new `overflow` flag and ignored it. It now refuses on
-  it. Unreachable today because `check_money_overflow` runs first, but it keeps
-  the mempool path consistent with the block path.
-- `getAliasFromExtra` scanned the whole extra for a `0xEA` byte instead of
-  parsing the field the caller had already located, so a `0xEA` inside another
-  field's payload started an alias parse at attacker-adjacent bytes — and a
-  failed parse returns false, which makes the caller reject the entire
-  transaction. It now takes the walker's tag offset.
-- The per-asset arithmetic helpers moved to `AssetType.h` so `Blockchain.cpp` and
-  `Core.cpp` share one definition instead of drifting.
-
-**Second adversarial review found two defects in the `unified` token work — both fixed here:**
-
-- `JsonRpcServer` looked up `Authorization` with that exact case, but `HttpParser`
-  lowercases every header name on the wire, so the lookup could never match and
-  **every** request — including one with a correct token — was rejected. Now reads
-  `"authorization"`, matching the daemon's own `HttpServer::authenticate`, and
-  accepts `bearer ` as well as `Bearer ` since RFC 7235 schemes are
-  case-insensitive.
-- The first token-file reader was a bare `std::ifstream` that enforced none of
-  the owner-only properties its own comment claimed: no `O_NOFOLLOW`, no uid
-  check, no group/other-bits check. A symlinked or group-readable token file was
-  accepted, so another local user could substitute their own token. The
-  container-password reader was already hardened against exactly this; it is now
-  parameterised on the option name and validator and shared by both, so the
-  token file gets the same `O_NOFOLLOW` + `S_ISREG` + uid + permission checks.
-
-**Also from the second review:**
-
-- `getAliasReleaseFromExtra` and `getAliasTransferFromExtra` byte-scanned the
-  whole extra for `0xEC`/`0xED` the same way registration did, and are called
-  from the same walker that already located the field. A `0xEC`/`0xED` byte in an
-  earlier field's payload triggered the identical misparse → `return false` →
-  whole-transaction rejection, or injected a phantom release/transfer. Both now
-  take the walker's tag offset.
-- Removed the unused `addAssetChecked` from `AssetType.h`; `addChecked` for
-  running sums stays file-local to `Blockchain.cpp`. A duplicate helper in a
-  consensus header is the drift footgun the header exists to prevent.
-- Probes no longer send a literal `Bearer ''` when no token is present.
-- The health probe now carries the token on loopback, so a gated `unified`
-  answers it instead of 401ing.
-- The `chmod 600` on the token file is checked, and the resulting mode verified,
-  instead of relying on a `debugPrint` that release builds strip.
-
-| Gate | Result | Evidence |
-|------|--------|----------|
-| Rust tests | PASS | `cargo test -p rust_fuego_wallet` — 30 passed, 0 failed (was 24) |
-| Rust builds | PASS | `cargo check --workspace` clean |
-| Analyzer | PASS | `dart analyze lib/` — 0 errors, 0 warnings (761 pre-existing infos) |
-| Flutter tests | PASS | `flutter test` — 80/80 |
-| C++ compiles | PASS | 6 translation units rebuilt, 0 errors, no new warnings |
-| Adversarial review | PASS | two passes; pass 2 found 2 blocking + 3 minor in `unified`/alias/Dart, all fixed |
-
-**Not verified — blocked on someone else's work:**
-
-- `fuegod` and `unified` do not **link**. 8 symbols are missing from
-  `XfgSwap::PriceWorker` and `XfgSwap::CoinGeckoFeed` in `libSwapDaemonLib.a`.
-  Confirmed pre-existing by stashing these changes and rebuilding: the same 8
-  symbols are missing at clean `f6e3482ba`. It comes from the price-feed commits
-  (`CoinGecko` source, bounded poll worker) in flight on `/Users/aejt/xfgo`.
-  Until that links, **no C++ test suite can run** and the `unified` auth path is
-  compile-verified only — it has never been executed. Enabling
-  `--auth-token-file` on `unified` must not ship before it has been run once.
-- The app has not been run against a real walletd or `unified`, so the Dart token
-  wiring is analyzer-verified and unit-tested, not exercised end to end. That is
-  the one check that would catch a missed client and a 401 brick.
-
-**Renaming `unified` → `unifyd` and the release artifact → `fuego-valise` are
-deliberately NOT in this commit** (they are mechanical, cross-repo, and mixing a
-consensus/security change with a bulk rename makes the pin bump harder to
-review). They land as a separate commit.
-
-**Sign-off:** space-bunny-free — 2026-10-09
-
----
-
-## [2026-10-09] walletd host gate: absent Host was authorized; dead IPv6 branch
-
-Found by the pre-implementation adversarial review of the walletd auth work
-(audit item 3, token gate). `is_authorized_host` ended in `else { true }`, so a
-request carrying neither `Host` nor any recognised host was authorized. The
-`"[::1]"` arm was also dead: the host was split on the first `:`, which lands
-inside the brackets and leaves a bare `[`.
+Merge `origin/feat/owner-bound-commitment-keys` (`51598e6`) into `origin/claude/okoc-valise-daemon-audit-1niqzp` (`5f32382`), fork `75034c0`. 4 files / 25 hunks. Performed in a scratch worktree; the dirty working tree was not touched. **Not pushed.**
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 1 | Refuse a request with no `Host` header | space-bunny-free | 2026-10-09 | DONE |
-| 2 | Parse bracketed IPv6 hosts instead of splitting on the first colon | space-bunny-free | 2026-10-09 | DONE |
-| 3 | Add `loopback_hosts_are_authorized_and_others_are_not` and `a_request_carrying_no_host_at_all_is_refused` | space-bunny-free | 2026-10-09 | DONE |
+| 112 | Resolve `transaction_builder.rs` (11 hunks) by keeping our side | opencode | 2026-10-04 | Done; ours carries `ddb7d12`, which changed every builder signature `view_pub` -> `view_secret`. Colin's side seeds `r = Hs(viewPub ‖ inputsHash)`, and his file has 4 `deterministic_tx_key(view_pub` against our 6 `deterministic_tx_key(view_secret`. Taking his side would have re-exposed `r` to anyone knowing the sender's address, defeating owner-bound commitments |
+| 113 | Resolve `phase7_vectors.rs` (7 hunks) by keeping our side | opencode | 2026-10-04 | Done; keeps the C++ `parseAndValidate` round-trip hashes `e39df476…` / `7006fa39…` and clears Colin's 2 failures |
+| 114 | Resolve `wallet_service.rs` (5 hunks) by keeping our side + his comment | opencode | 2026-10-04 | Done; his entire diff to this file was 5 `spend_pub` lines we already had plus one comment |
+| 115 | Resolve `scanner.rs` (2 hunks) by keeping ours and adding his legacy-account loop | opencode | 2026-10-04 | Done; **taking his side wholesale would have regressed two things** — it drops `state.owners.insert` for commitments, which breaks the existing `commitments_found_owner_bound_by_owner_and_legacy` owner assertions, and it raises `highest_subaddress` with a *legacy keypair index*, corrupting the suite-sub-address lookahead |
+| 116 | Close the partial gap in his fix | opencode | 2026-10-04 | His `None` fallback still uses the master `derivation`, so a legacy-*form* commitment at a legacy account is still missed on his branch. The merged loop tries owner-bound then legacy-form, each under the account's own derivation |
+| 117 | Add regression test `commitments_found_on_legacy_accounts` | opencode | 2026-10-04 | Done; **negative control**: with the patch removed it fails `left: 0, right: 2`, independently reproducing the gap. With the patch, both commitments are found and every recorded scalar opens its key |
+| 118 | Route our builder helper onto Colin's `ring.rs` wrapper | opencode | 2026-10-04 | Done; his 4 wrappers auto-merged and all compile. `owner_bound_commit_key` now calls `derive_owner_bound_commit_key`, so the factoring is shared without any regression |
+| 119 | Record that `b8b0e93`'s commit message overclaims | opencode | 2026-10-04 | `CommitmentEntry.exposed` and `SCAN_VERSION 3` are named in the message but exist in neither branch. Noted in task 110 of the 2026-10-04 entry above |
 
-A bearer token is still the real fix and is not in this entry; the host gate is
-DNS-rebinding defense, not authorization. On desktop the token is not a boundary
-against same-user processes — the stated target is Android, where another app
-can reach loopback but cannot read app-private storage.
+### Sign-off
 
-| Gate | Result | Evidence |
-|------|--------|----------|
-| Tests pass | PASS | `cargo test -p rust_fuego_wallet` — 26 passed, 0 failed (was 24; +2 new) |
-| Workspace builds | PASS | `cargo check --workspace` — Finished dev profile |
-
-**Sign-off:** space-bunny-free — 2026-10-09
-
----
-
-## [2026-10-09] Audit item pass: dead Rust tree, dead Dart deposit, stale CD fee docs
-
-Closes three findings from the 12-item audit tracked in `AUDIT_STATUS.md`
-(items 10b, 10d, 12). No consensus, wallet-format, or RPC behaviour changes.
-
-`rust-fuego-wallet/src/` is not a workspace member — `Cargo.toml` lists only
-`core` plus the four SDK crates, and `core/Cargo.toml` points its bin at its own
-`src/main.rs`. No CI, script, or Dart reference reaches the root tree. The two
-files named in the audit were byte-identical to the `core/src/` copies.
-
-| # | Task | Owner | Date | Status |
-|---|------|-------|------|--------|
-| 1 | Delete `rust-fuego-wallet/src/keystore.rs` (identical to `core/src/keystore.rs`) | space-bunny-free | 2026-10-09 | DONE |
-| 2 | Delete `rust-fuego-wallet/src/wallet.rs` (identical to `core/src/wallet.rs`) | space-bunny-free | 2026-10-09 | DONE |
-| 3 | Delete dead Dart `createDeposit` from `fuego_wallet_adapter.dart` — zero call sites, and its `create_deposit` method has no daemon route | space-bunny-free | 2026-10-09 | DONE |
-| 4 | Correct the CD creation-fee destination in `fuego-suite/README.md` (2 sites) | space-bunny-free | 2026-10-09 | DONE |
-| 5 | Same correction in `how-cds-work.mdx` and `interest-and-yield.mdx` | space-bunny-free | 2026-10-09 | DONE |
-
-The fee is burned and credited (as ΗΞΔŦ) to the Treasury LP Manager via the
-`TreasuryFund` tag from v12; the @fuegoxfg development-fund donation is the
-pre-v12 behaviour and is now labelled as historical.
-
-| Gate | Result | Evidence |
-|------|--------|----------|
-| Rust builds | PASS | `cargo check -p rust_fuego_wallet` — Finished dev profile in 22.50s, no errors |
-| Analyzer | PASS | `dart analyze lib/` — 0 errors, 0 warnings (761 pre-existing infos) |
-| Tests pass | PASS | `flutter test` — 80/80, All tests passed |
-| Doc grep | PASS | no remaining `donated/sent to @fuegoxfg` outside the labelled pre-v12 note |
-| All tasks done | PASS | 5/5 |
-
-**Deliberately not touched:**
-- The other 8 orphaned files in `rust-fuego-wallet/src/` (`base58.rs`, `crypto.rs`,
-  `daemon.rs`, `fuegod.rs`, `main.rs`, `release.rs`, `server.rs`, `walletd.rs`) — also
-  dead, but outside the two files the audit named. `server.rs` diverges (653 vs 1162
-  lines) and `SECURITY_REVIEW.md` cites this tree as reviewed surface.
-- `docs/developer/unified-commitment-plan.md:39` still labels term 1..MAX_TERM as
-  "XFG CD". Reads as a historical design doc; not edited without reading it in full.
-
-**Sign-off:** space-bunny-free — 2026-10-09
-
----
-
-## [2026-10-08] DeXFG swap daemon execution contract
-
-DeXFG now consumes the daemon's runtime network and chain catalog, preserves
-amounts as decimal strings through JSON-RPC, requires configured and ready chain
-adapters plus a pinned counterparty key, and treats ambiguous mutation responses
-as unknown outcomes. AFK soft-order requests read the daemon capability and stop
-before key or reserve-proof work while the suite path remains disabled.
-
-| # | Task | Owner | Date | Status |
-|---|------|-------|------|--------|
-| 1 | Add token-authenticated, no-redirect, bounded swap RPC transport | Codex | 2026-10-08 | DONE |
-| 2 | Enforce daemon network/profile and runtime chain readiness | Codex | 2026-10-08 | DONE |
-| 3 | Convert display amounts with `BigInt` and enforce protocol ranges | Codex | 2026-10-08 | DONE |
-| 4 | Require peer endpoint and nonzero 32-byte counterparty key | Codex | 2026-10-08 | DONE |
-| 5 | Mark initiate, accept, refund, and timeout checks as ambiguous on transport failure | Codex | 2026-10-08 | DONE |
-| 6 | Decode exact root atomic amounts, runtime pair names, and numeric status flags | Codex | 2026-10-08 | DONE |
-| 7 | Gate AFK soft orders on the daemon capability | Codex | 2026-10-08 | DONE |
-
-| Gate | Result | Agent | Date |
-|------|--------|-------|------|
-| Focused Flutter tests | PASS — 8 tests | Codex | 2026-10-08 |
-| Focused analyzer | PASS — no errors or warnings; informational lints remain | Codex | 2026-10-08 |
-| Diff whitespace check | PASS | Codex | 2026-10-08 |
-| All tasks done | PASS | Codex | 2026-10-08 |
-
----
+| Check | Result |
+|-------|--------|
+| `cargo build --workspace` | ✅ clean, no errors, no warnings |
+| `cargo test --workspace` | ✅ **115 passed, 0 failed** (fuego-crypto 20, fuego-ffi 6, fuego-sdk 65, walletd 24) |
+| Both vector suites coexist | ✅ `ownerbound_vectors` (Colin's, 70 vectors) **and** `commitment_owner_bound_vectors` (ours) both pass; `crosscheck_ownerbound_vectors` proves parity 70/70 |
+| `phase7_vectors` | ✅ 10/10; Colin's 2 failures cleared |
+| Regression test negative control | ✅ fails `0 vs 2` without the patch, passes with it |
+| Byte-vector parity negative control | ✅ flipping one expected byte fails the assert |
+| All tasks done | Merge resolved and verified in a scratch worktree. **No push, no PR** |
+| `flutter test` | ✅ **72 passed, 0 failed** — includes Colin's 13 `swap_pair_drift_test.dart` |
+| `flutter analyze --no-pub --fatal-warnings --no-fatal-infos` | ✅ exit 0; 0 errors, 0 warnings (780 info-level, pre-existing) |
+| Scope | Merge + scanner fix + two test files. The pre-existing dirty working tree, local branches and refs were left untouched |
 
 ## [2026-10-01] Swap-pair drift: 10 DeXFG pairs rendered as `PAIR_<n>`
 
@@ -399,30 +77,38 @@ before key or reserve-proof work while the suite path remains disabled.
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 67 | iOS archive had no `fuego_*` symbols: release links dead-strip, and ld64 does not keep a main executable's unreferenced globals. Added `-Xlinker -export_dynamic` next to each `-force_load` | claude-opus-5-5 | 2026-09-26 | ✅ done (verified by CI) |
-| 68 | Runner build phase "Build fuego-ffi" (`scripts/build-ios-ffi.sh`) builds the Rust slice for the active SDK/arch; clean Xcode/flutter builds no longer need a manual cargo step (review #7) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 69 | Android natives: cargo-ndk 4.1.2 could not link against NDK r25b (`crtbegin_so.o`, `-llog`). Use the runner's preinstalled NDK (27.x), which master's green builds used | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 70 | walletd JSON-RPC: the `is_wallet_method` allowlist omitted the sub-address methods and several handled aliases (`getHealth`, `transfer`, `send_heat`, `create_afk_lock`, `heat_cd`, ...), which returned "unknown method". Removed it; the handler is the only list, and unhandled names fall through to the fuegod proxy. Dropped the placeholder zero-APY arm so `cd::apy` still reaches fuegod (review #4) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 71 | Outputs whose `get_o_indexes` failed keep global index 0 and could never be spent or swept; retried every sync round (review #3) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 72 | Zero 8-byte stratum target rejected (-2) (review #8) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 73 | Core client wallet port follows mainnet/testnet switches when the local proxy runs (review #2) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 74 | Backgrounding locks through `WalletProvider.lockWallet()` (clears cached data), and resuming routes to `PinEntryScreen` when a PIN is set (review #5) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 75 | Linux launcher symlink pointed at "Fuego Valise" (display name); the binary is `fuegowallet` (`BINARY_NAME`). Bundle step reads it from CMakeLists and checks the link resolves; flatpak fixed too (review #6) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 76 | `unified` is required: the desktop build fails without it, and bundling requires all four backends (review #1) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 77 | Main CI Analyze passed `--fatal-warnings` but infos were still fatal by default (red on master too); added `--no-fatal-infos` as the step's comment intends | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 78 | Suite's CMake adds `-march=native` to Crypto whenever `CI`/`GITHUB_*` is set at configure; release `fuegod`/`xfg-swapd` could SIGILL on user CPUs older than the runner, and the cached wire-check build did SIGILL on another runner. Desktop builds and the wire check now configure with those vars unset; cache key bumped | claude-opus-5-5 | 2026-09-27 | ✅ done |
-| 79 | Android export check used `readelf -s --dyn-syms \| grep -q` under pipefail: grep exits on the match, readelf takes SIGPIPE (141), the step failed with the symbol present. Now `--dyn-syms` only, full read | claude-opus-5-5 | 2026-09-27 | ✅ done |
-| 80 | iOS symbol check failed on the debug simulator build: Xcode `ENABLE_DEBUG_DYLIB` puts app code in `Runner.debug.dylib`. The script now includes it when present | claude-opus-5-5 | 2026-09-27 | ✅ done |
-| 81 | walletd ran on its own random `master_seed.bin`: GUI balance (`scan_balance` ignored the keys), sends, history and sub-addresses were that key's, not the vault's. walletd now starts with `--await-wallet`; the app sends the vault seed (`open_wallet`) after unlock and `close_wallet` on lock; per-wallet state dirs with a wallet-id guard; `scan_balance` checks keys (409) | claude-opus-5-5 | 2026-09-29 | ✅ done |
-| 82 | Existing `master_seed.bin` wallet is synced as the legacy wallet and swept into the vault wallet from the receive screen (`get_legacy_wallet`, `sweep_legacy_wallet`, 50 inputs per tx); file kept | claude-opus-5-5 | 2026-09-29 | ✅ done |
-| 83 | Sync wrote the top block hash per block but the height/outputs per batch: quitting mid-batch skipped blocks for good. Hash and state now written in one sled batch; scanner skips outputs already held or spent (re-scan idempotent) | claude-opus-5-5 | 2026-09-29 | ✅ done |
-| 84 | Sub-address list reconciled with walletd's (labels and hidden entries kept by address); legacy sub-addresses re-registered per opened wallet; stale pre-`open_wallet` walletd is restarted instead of reused | claude-opus-5-5 | 2026-09-29 | ✅ done |
+| 67 | iOS archive had no `fuego_*` symbols: release links dead-strip, and ld64 does not keep a main executable's unreferenced globals. Added `-Xlinker -export_dynamic` next to each `-force_load` | claude | 2026-09-26 | ✅ done (verified by CI) |
+| 68 | Runner build phase "Build fuego-ffi" (`scripts/build-ios-ffi.sh`) builds the Rust slice for the active SDK/arch; clean Xcode/flutter builds no longer need a manual cargo step (review #7) | claude | 2026-09-26 | ✅ done |
+| 69 | Android natives: cargo-ndk 4.1.2 could not link against NDK r25b (`crtbegin_so.o`, `-llog`). Use the runner's preinstalled NDK (27.x), which master's green builds used | claude | 2026-09-26 | ✅ done |
+| 70 | walletd JSON-RPC: the `is_wallet_method` allowlist omitted the sub-address methods and several handled aliases (`getHealth`, `transfer`, `send_heat`, `create_afk_lock`, `heat_cd`, ...), which returned "unknown method". Removed it; the handler is the only list, and unhandled names fall through to the fuegod proxy. Dropped the placeholder zero-APY arm so `cd::apy` still reaches fuegod (review #4) | claude | 2026-09-26 | ✅ done |
+| 71 | Outputs whose `get_o_indexes` failed keep global index 0 and could never be spent or swept; retried every sync round (review #3) | claude | 2026-09-26 | ✅ done |
+| 72 | Zero 8-byte stratum target rejected (-2) (review #8) | claude | 2026-09-26 | ✅ done |
+| 73 | Core client wallet port follows mainnet/testnet switches when the local proxy runs (review #2) | claude | 2026-09-26 | ✅ done |
+| 74 | Backgrounding locks through `WalletProvider.lockWallet()` (clears cached data), and resuming routes to `PinEntryScreen` when a PIN is set (review #5) | claude | 2026-09-26 | ✅ done |
+| 75 | Linux launcher symlink pointed at "Fuego Valise" (display name); the binary is `fuegowallet` (`BINARY_NAME`). Bundle step reads it from CMakeLists and checks the link resolves; flatpak fixed too (review #6) | claude | 2026-09-26 | ✅ done |
+| 76 | `unified` is required: the desktop build fails without it, and bundling requires all four backends (review #1) | claude | 2026-09-26 | ✅ done |
+| 77 | Main CI Analyze passed `--fatal-warnings` but infos were still fatal by default (red on master too); added `--no-fatal-infos` as the step's comment intends | claude | 2026-09-26 | ✅ done |
+| 78 | Suite's CMake adds `-march=native` to Crypto whenever `CI`/`GITHUB_*` is set at configure; release `fuegod`/`xfg-swapd` could SIGILL on user CPUs older than the runner, and the cached wire-check build did SIGILL on another runner. Desktop builds and the wire check now configure with those vars unset; cache key bumped | claude | 2026-09-27 | ✅ done |
+| 79 | Android export check used `readelf -s --dyn-syms \| grep -q` under pipefail: grep exits on the match, readelf takes SIGPIPE (141), the step failed with the symbol present. Now `--dyn-syms` only, full read | claude | 2026-09-27 | ✅ done |
+| 80 | iOS symbol check failed on the debug simulator build: Xcode `ENABLE_DEBUG_DYLIB` puts app code in `Runner.debug.dylib`. The script now includes it when present | claude | 2026-09-27 | ✅ done |
+| 81 | walletd ran on its own random `master_seed.bin`: GUI balance (`scan_balance` ignored the keys), sends, history and sub-addresses were that key's, not the vault's. walletd now starts with `--await-wallet`; the app sends the vault seed (`open_wallet`) after unlock and `close_wallet` on lock; per-wallet state dirs with a wallet-id guard; `scan_balance` checks keys (409) | claude | 2026-09-29 | ✅ done |
+| 82 | Existing `master_seed.bin` wallet is synced as the legacy wallet and swept into the vault wallet from the receive screen (`get_legacy_wallet`, `sweep_legacy_wallet`, 50 inputs per tx); file kept | claude | 2026-09-29 | ✅ done |
+| 83 | Sync wrote the top block hash per block but the height/outputs per batch: quitting mid-batch skipped blocks for good. Hash and state now written in one sled batch; scanner skips outputs already held or spent (re-scan idempotent) | claude | 2026-09-29 | ✅ done |
+| 84 | Sub-address list reconciled with walletd's (labels and hidden entries kept by address); legacy sub-addresses re-registered per opened wallet; stale pre-`open_wallet` walletd is restarted instead of reused | claude | 2026-09-29 | ✅ done |
+| 90 | Commitment outputs (HEAT, LP, swap receipts, CDs) were built with the legacy key, spendable by the sender and any view-key holder (`send_heat` even discarded the recipient's spend key). Builders now emit owner-bound keys `derive_public_key(D, i, B)` (suite `keyderiv` parity); scanner matches owner-bound via the sub-address table, falls back to the legacy form | claude | 2026-10-02 | ✅ done |
+| 91 | Byte-for-byte C++/Rust vectors from keyderiv (primary + sub-addresses, 5 indices, legacy); Rust-built mint and HEAT-send txs parse and round-trip in suite's production parser with matching hashes | claude | 2026-10-02 | ✅ done |
+| 92 | Every SDK builder seeded the tx secret r = Hs(seed ‖ inputsHash) with the sender's view **public** key; anyone holding the sender's address could recompute r, link the sender's txs and test outputs against known addresses. Builders now take the view secret (suite `generateDeterministicTransactionKeys`). `get_tx_proof` tries the secret seed, then the public seed for txs sent before the fix (it produced invalid proofs for every Rust-built tx). Pinned hashes regenerated; suite's C++ parser round-trips each | claude | 2026-10-03 | ✅ done |
+| 93 | `send_heat`, `create_cd`/`heat_cd`, `claim_cd`, `rollover_cd` paid the fee out of HEAT. suite's `pushBlock` (v10+) conserves HEAT exactly; the mempool sums both assets and accepted them, then any block including one was invalid. New `build_commitment_spend_xfg_fee_transaction`: XFG key inputs pay MINIMUM_FEE. `claim_cd` paid CDs out as XFG (rejected); it now returns principal + interest as HEAT bills. GUI shows the HEAT send fee as 0.0008 XFG | claude | 2026-10-03 | ✅ done |
+| 94 | 8 HEAT epoch-to-epoch auto-roll CD (900-block term) removed from walletd and the GUI: suite rejects terms below 6 epochs and keeps auto-roll off until v13. 8 HEAT is the minimum CD amount with normal terms | claude | 2026-10-03 | ✅ done |
+| 95 | `docs/IOS_WALLETD_FFI_SCOPE.md` rewritten: run walletd's axum server in-process on iOS (FFI start/stop in `fuego-ffi` behind a `walletd` feature) instead of wrapping 39 methods; prerequisite token auth on walletd for all platforms | claude | 2026-10-03 | ✅ plan |
+| 96 | Not fixed, found: walletd accepts any local caller (only a `Host` check); while a wallet is open any local process, or any Android app with INTERNET, can call `send_transaction`. Plan step 1 in the iOS scope doc | claude | 2026-10-03 | ⏳ open |
+| 97 | Not fixed, suite consensus: commitment rings mix terms of the same amount and `classifyInputAsset` classifies by the first ring member, so a HEAT spend whose lowest-index decoy is an LP or pool output is misclassified; `fee_summary` adds the combined-asset fee, so treasury burns and HEAT→XFG swap deltas are paid to the miner as XFG. Both are in keyderiv's Part 2 (asset accounting), not started | claude | 2026-10-03 | ⏳ open (suite) |
 
 ### Sign-off
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace` | ✅ 96 passed |
+| `cargo test --workspace` | ✅ 109 passed (after rows 92–94) |
 | `check_ffi_bindings.py --strict` | ✅ clean |
 | `flutter analyze --fatal-warnings --no-fatal-infos` / `flutter test` | ✅ / ✅ 59 |
 | `dart format --set-exit-if-changed lib/ test/` | ❌ 94/108 files, same on master; not reformatted in this PR |
@@ -432,15 +118,15 @@ before key or reserve-proof work while the suite path remains disabled.
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 58 | `build.rs` compiles suite `slow-hash.c` from `OUT_DIR` with exact-text fixes: the `VARIANT2_PORTABLE_SHUFFLE_ADD` light-mode store offsets (wrong CN-UPX/2 on every Android ABI) and the `VARIANT1_INIT64` unaligned load (armv7 SIGBUS). It also defines `FORCE_USE_HEAP` (the 2 MiB stack scratchpad overflowed ~1 MiB isolate stacks). Upstream patch: `fuego-ffi/patches/slow-hash-portable.patch` | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 59 | `fuego_cn_slow_hash`: `unsafe`, null/variant/length checks (the C code `_exit(1)`s on short v1 input). `fuego_mine_share`: xmrig share rule (u64 at hash[24..32] vs expanded 4-/8-byte stratum target; it compared hash[0..4]), `target_len` parameter, null checks, -2 on bad arguments | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 60 | Tests: mainnet block 1,000,001 PoW meets its difficulty (pinned `ce75e028…`); argument rejection; stratum target semantics; `mine_share` agrees with `cn_slow_hash`. CI job `ffi-cryptonight-paths`: `-DNO_AES`, aarch64 (no crypto) and armv7 under qemu | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 61 | Dart FFI: `usize` → `Size`, `u32`/`u64` → `Uint32`/`Uint64` (checker `--strict` clean). Length `assert`s (stripped in release) replaced by unconditional checks, plus a u32 index range check. Secret buffers wiped before free (Dart `_freeSecret`; Rust `fuego_string_free`/`fuego_bytes_free` wipe) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 62 | `.github/actions/build-android-natives`: cargo-ndk, 4 ABIs, 16 KB page alignment, readelf alignment and export checks. Used by mobile CI, Play Store (never built the FFI before) and F-Droid (never linked or bundled it) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 63 | `scripts/check-ios-ffi-symbols.sh` (Runner, xcarchive or IPA) in mobile CI and both iOS release workflows, now also after IPA export. `ios-release.yml` maps the signing secrets into job `env` (its gated steps always skipped) | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 64 | `Keypair::from_secret` stores the reduced scalar. Vault secrets were raw Keccak output, rejected by `sc_check` in `generate_key_derivation`/`derive_secret_key` for ~15/16 seeds (probe: 3/64 passed), so walletd found and spent nothing for those wallets. Walletd `scan_version` 2 triggers one rescan of older state | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 65 | `parse_address` stripped the "fire"/"TEST" base58 lead and required ≥72 decoded bytes (addresses are 71), so it parsed 0/32 addresses; every walletd send and tx proof failed. It now decodes the whole string. `decode_block` rejects overflow, which used to panic in debug | claude-opus-5-5 | 2026-09-26 | ✅ done |
-| 66 | Sub-addresses in suite's scheme: `fuego_crypto::derive_subaddress_keys` (byte-identical to suite C++ on 5 vectors). Scanner uses one master derivation plus a spend-key table (lookahead 50) and records the owner per output. Walletd adds `create_subaddress`, `get_subaddresses`, `register_legacy_subaddresses` (one rescan) and `sweep_legacy_subaddresses`. Dart: store v2 marks old entries legacy, creation goes through walletd, the receive screen shows a sweep banner and legacy entries can't be copied or selected, and the privacy copy is corrected (sub-addresses are linkable). Removed the vault's unused incompatible `100+2n` helpers | claude-opus-5-5 | 2026-09-26 | ✅ done |
+| 58 | `build.rs` compiles suite `slow-hash.c` from `OUT_DIR` with exact-text fixes: the `VARIANT2_PORTABLE_SHUFFLE_ADD` light-mode store offsets (wrong CN-UPX/2 on every Android ABI) and the `VARIANT1_INIT64` unaligned load (armv7 SIGBUS). It also defines `FORCE_USE_HEAP` (the 2 MiB stack scratchpad overflowed ~1 MiB isolate stacks). Upstream patch: `fuego-ffi/patches/slow-hash-portable.patch` | claude | 2026-09-26 | ✅ done |
+| 59 | `fuego_cn_slow_hash`: `unsafe`, null/variant/length checks (the C code `_exit(1)`s on short v1 input). `fuego_mine_share`: xmrig share rule (u64 at hash[24..32] vs expanded 4-/8-byte stratum target; it compared hash[0..4]), `target_len` parameter, null checks, -2 on bad arguments | claude | 2026-09-26 | ✅ done |
+| 60 | Tests: mainnet block 1,000,001 PoW meets its difficulty (pinned `ce75e028…`); argument rejection; stratum target semantics; `mine_share` agrees with `cn_slow_hash`. CI job `ffi-cryptonight-paths`: `-DNO_AES`, aarch64 (no crypto) and armv7 under qemu | claude | 2026-09-26 | ✅ done |
+| 61 | Dart FFI: `usize` → `Size`, `u32`/`u64` → `Uint32`/`Uint64` (checker `--strict` clean). Length `assert`s (stripped in release) replaced by unconditional checks, plus a u32 index range check. Secret buffers wiped before free (Dart `_freeSecret`; Rust `fuego_string_free`/`fuego_bytes_free` wipe) | claude | 2026-09-26 | ✅ done |
+| 62 | `.github/actions/build-android-natives`: cargo-ndk, 4 ABIs, 16 KB page alignment, readelf alignment and export checks. Used by mobile CI, Play Store (never built the FFI before) and F-Droid (never linked or bundled it) | claude | 2026-09-26 | ✅ done |
+| 63 | `scripts/check-ios-ffi-symbols.sh` (Runner, xcarchive or IPA) in mobile CI and both iOS release workflows, now also after IPA export. `ios-release.yml` maps the signing secrets into job `env` (its gated steps always skipped) | claude | 2026-09-26 | ✅ done |
+| 64 | `Keypair::from_secret` stores the reduced scalar. Vault secrets were raw Keccak output, rejected by `sc_check` in `generate_key_derivation`/`derive_secret_key` for ~15/16 seeds (probe: 3/64 passed), so walletd found and spent nothing for those wallets. Walletd `scan_version` 2 triggers one rescan of older state | claude | 2026-09-26 | ✅ done |
+| 65 | `parse_address` stripped the "fire"/"TEST" base58 lead and required ≥72 decoded bytes (addresses are 71), so it parsed 0/32 addresses; every walletd send and tx proof failed. It now decodes the whole string. `decode_block` rejects overflow, which used to panic in debug | claude | 2026-09-26 | ✅ done |
+| 66 | Sub-addresses in suite's scheme: `fuego_crypto::derive_subaddress_keys` (byte-identical to suite C++ on 5 vectors). Scanner uses one master derivation plus a spend-key table (lookahead 50) and records the owner per output. Walletd adds `create_subaddress`, `get_subaddresses`, `register_legacy_subaddresses` (one rescan) and `sweep_legacy_subaddresses`. Dart: store v2 marks old entries legacy, creation goes through walletd, the receive screen shows a sweep banner and legacy entries can't be copied or selected, and the privacy copy is corrected (sub-addresses are linkable). Removed the vault's unused incompatible `100+2n` helpers | claude | 2026-09-26 | ✅ done |
 
 ### Sign-off
 
@@ -458,9 +144,9 @@ before key or reserve-proof work while the suite path remains disabled.
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 55 | `.claude/skills/fuego-ffi`: SKILL.md (boundary conventions, type mapping, add-a-function steps, verification gates, suite-bump checks, known debt), `references/platforms.md`, `references/cryptonight.md`, `scripts/check_ffi_bindings.py` (Rust export vs Dart typedef arity/width/signedness + `#[repr(C)]` struct layout) | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 56 | Evaluate the skill: 4 prompts × with/without skill, graded + benchmarked | claude-opus-5-5 | 2026-09-25 | ✅ done: with 100%, without 92%; -12% time, -6% tokens |
-| 57 | iOS symbol checks (mobile CI, `ios-release.yml`, `appstore-release.yml`) used `grep -E "(a\|b\|c)"`, which passed if any one symbol survived; now every symbol must be present | claude-opus-5-5 | 2026-09-25 | ✅ done |
+| 55 | `.claude/skills/fuego-ffi`: SKILL.md (boundary conventions, type mapping, add-a-function steps, verification gates, suite-bump checks, known debt), `references/platforms.md`, `references/cryptonight.md`, `scripts/check_ffi_bindings.py` (Rust export vs Dart typedef arity/width/signedness + `#[repr(C)]` struct layout) | claude | 2026-09-25 | ✅ done |
+| 56 | Evaluate the skill: 4 prompts × with/without skill, graded + benchmarked | claude | 2026-09-25 | ✅ done: with 100%, without 92%; -12% time, -6% tokens |
+| 57 | iOS symbol checks (mobile CI, `ios-release.yml`, `appstore-release.yml`) used `grep -E "(a\|b\|c)"`, which passed if any one symbol survived; now every symbol must be present | claude | 2026-09-25 | ✅ done |
 
 Defects found by the evals and verified, **not fixed** (recorded in the skill's known debt):
 
@@ -487,14 +173,14 @@ Defects found by the evals and verified, **not fixed** (recorded in the skill's 
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 47 | Settings → Network → Connect loaded `assets/bin/fuego_walletd-*` (never produced by any build) via `WalletDaemonService`, bypassing `NodeConnection`. Now `NodeConnection.switchNetwork()` retargets ports/seeds, persists the choice (`node_network` pref, honored at next launch unless `FUEGO_TESTNET` is set) and reconnects; the screen opens on the active network | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 48 | `useTestnet` followed only the env var, so a runtime switch would be reverted by Settings' local/remote toggles; it now reads `NodeConnection` | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 49 | Chain clients (`daemon`, `hearthClient`) and `DexCubit` now follow every reconnect via `NodeConnection.addListener` instead of being pinned at startup | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 50 | Delete now-unreferenced `wallet_daemon_service.dart`, `cli_service.dart`, `assets/bin/` (+ pubspec entry, README tree line) | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 51 | `linux/xfg-wallet.desktop`: `Exec=Fuego Wallet` (nonexistent) → `Exec=fuego-valise`; `Name` → Fuego Valise; `StartupWMClass` → fuego-valise (GTK3 derives it from argv[0]). Shared Linux bundle step now creates the `fuego-valise` launcher symlink for tarball/flatpak/snap | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 52 | iOS: force-load `libfuego_ffi.a` into Runner (per SDK/arch `OTHER_LDFLAGS` at target level so `$(inherited)` keeps CocoaPods flags), `STRIP_STYLE = non-global`; `FuegoNative` uses `DynamicLibrary.process()`. Mobile CI drops the loose-dylib copy (App Store-rejected) for a linked-symbol check; both iOS release workflows build the staticlib and check symbols survive archive stripping | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 53 | Correct suite `AGENTS.md` (`queryblockslite.bin` hang claim, Boost 1.86+ note) | claude-opus-5-5 | 2026-09-25 | ⛔ blocked: push access to `usexfg/fuego-suite` denied by permission classifier; replacement text given to user |
-| 54 | Look for a previously created fuego-ffi skill (Claude / opencode) | claude-opus-5-5 | 2026-09-25 | ✅ searched: none in synced Claude skills, claude.ai library, either repo's `.claude/`/`.opencode/`, or reachable history |
+| 47 | Settings → Network → Connect loaded `assets/bin/fuego_walletd-*` (never produced by any build) via `WalletDaemonService`, bypassing `NodeConnection`. Now `NodeConnection.switchNetwork()` retargets ports/seeds, persists the choice (`node_network` pref, honored at next launch unless `FUEGO_TESTNET` is set) and reconnects; the screen opens on the active network | claude | 2026-09-25 | ✅ done |
+| 48 | `useTestnet` followed only the env var, so a runtime switch would be reverted by Settings' local/remote toggles; it now reads `NodeConnection` | claude | 2026-09-25 | ✅ done |
+| 49 | Chain clients (`daemon`, `hearthClient`) and `DexCubit` now follow every reconnect via `NodeConnection.addListener` instead of being pinned at startup | claude | 2026-09-25 | ✅ done |
+| 50 | Delete now-unreferenced `wallet_daemon_service.dart`, `cli_service.dart`, `assets/bin/` (+ pubspec entry, README tree line) | claude | 2026-09-25 | ✅ done |
+| 51 | `linux/xfg-wallet.desktop`: `Exec=Fuego Wallet` (nonexistent) → `Exec=fuego-valise`; `Name` → Fuego Valise; `StartupWMClass` → fuego-valise (GTK3 derives it from argv[0]). Shared Linux bundle step now creates the `fuego-valise` launcher symlink for tarball/flatpak/snap | claude | 2026-09-25 | ✅ done |
+| 52 | iOS: force-load `libfuego_ffi.a` into Runner (per SDK/arch `OTHER_LDFLAGS` at target level so `$(inherited)` keeps CocoaPods flags), `STRIP_STYLE = non-global`; `FuegoNative` uses `DynamicLibrary.process()`. Mobile CI drops the loose-dylib copy (App Store-rejected) for a linked-symbol check; both iOS release workflows build the staticlib and check symbols survive archive stripping | claude | 2026-09-25 | ✅ done |
+| 53 | Correct suite `AGENTS.md` (`queryblockslite.bin` hang claim, Boost 1.86+ note) | claude | 2026-09-25 | ⛔ blocked: push access to `usexfg/fuego-suite` denied by permission classifier; replacement text given to user |
+| 54 | Look for a previously created fuego-ffi skill (Claude / opencode) | claude | 2026-09-25 | ✅ searched: none in synced Claude skills, claude.ai library, either repo's `.claude/`/`.opencode/`, or reachable history |
 
 ### Sign-off
 
@@ -512,18 +198,18 @@ Defects found by the evals and verified, **not fixed** (recorded in the skill's 
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 35 | Delete `native/crypto` (incl. 384 committed build artifacts, ~92 MB), `lib/native`, and the committed arm64-only `macos/Runner/libfuego_ffi.dylib` (now gitignored); drop `native/crypto` from mobile CI | claude-opus-5-5 | 2026-09-25 | ✅ done (user approved) |
-| 36 | Move desktop build + bundling into shared composite actions `build-desktop-backends` / `bundle-desktop-backends`; CI and all desktop release workflows use them | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 37 | Linux builds (CI tarball, flatpak, snap) never bundled `libfuego_ffi.so`, so wallet create/unlock (`FuegoVaultService` → FFI) failed on Linux. Now bundled in `lib/`; `FuegoNative` loads it by explicit path | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 38 | All 5 release workflows built suite's old C++ `walletd` from 8-month-stale `HEAT` into `assets/bin/` (never read by the app). Desktop ones now build/bundle the real backends from the pinned submodule; iOS ones drop the step (iOS cannot spawn it) | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 39 | `appstore-release`: `subosher/setup-flutter@v1` → `subosito/flutter-action@v2`; signing identity `"Developer ID Application: $APPLE_TEAM_ID"` never matches a cert CN → identity read from the imported keychain | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 40 | `macos-release`: bundle path `fuego-wallet.app` → `fuego_wallet.app` (verify step failed every run); signing gated on never-set `env.APPLE_CERTIFICATE` → step output | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 41 | `scripts/sign-macos-app.sh`: one signer for CI (ad-hoc) and releases (keychain identity, hardened runtime, timestamp); CI re-sign no longer fails when optional `unified` is absent | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 42 | Stop duplicating macOS daemons into `Contents/Resources/bin` (never used; still pointed at Homebrew dylib paths) | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 43 | Linux executable is `Fuego Valise` (space). Flatpak `command: fuego_wallet` and snap `xfg-wallet` named nonexistent binaries, and snap split the exe from its `lib/`. Both now install the bundle intact under `fuego-valise/` with a `fuego-valise` launcher symlink; flatpak skips copying `.git`, `fuego-suite`, Rust `target` | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 44 | Flatpak/snap jobs → ubuntu-22.04 (snap `--destructive-mode` requires host = core22 base; oldest glibc); snap's stale `assets/bin` walletd part removed | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 45 | Wire test `get_random_outs_returns_known_output`: genesis coinbase key + amount from fuegod JSON must come back from `getrandom_outs.bin` with the global index `get_o_indexes.bin` reports — covers non-empty record layout and the `get_o_indexes` parser | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 46 | Delete `scripts/get_walletd_binary.sh`, `scripts/build-fuego-source.sh` (build suite walletd from `HEAT` into `assets/bin` under names nothing loads; unreferenced) | claude-opus-5-5 | 2026-09-25 | ✅ done |
+| 35 | Delete `native/crypto` (incl. 384 committed build artifacts, ~92 MB), `lib/native`, and the committed arm64-only `macos/Runner/libfuego_ffi.dylib` (now gitignored); drop `native/crypto` from mobile CI | claude | 2026-09-25 | ✅ done (user approved) |
+| 36 | Move desktop build + bundling into shared composite actions `build-desktop-backends` / `bundle-desktop-backends`; CI and all desktop release workflows use them | claude | 2026-09-25 | ✅ done |
+| 37 | Linux builds (CI tarball, flatpak, snap) never bundled `libfuego_ffi.so`, so wallet create/unlock (`FuegoVaultService` → FFI) failed on Linux. Now bundled in `lib/`; `FuegoNative` loads it by explicit path | claude | 2026-09-25 | ✅ done |
+| 38 | All 5 release workflows built suite's old C++ `walletd` from 8-month-stale `HEAT` into `assets/bin/` (never read by the app). Desktop ones now build/bundle the real backends from the pinned submodule; iOS ones drop the step (iOS cannot spawn it) | claude | 2026-09-25 | ✅ done |
+| 39 | `appstore-release`: `subosher/setup-flutter@v1` → `subosito/flutter-action@v2`; signing identity `"Developer ID Application: $APPLE_TEAM_ID"` never matches a cert CN → identity read from the imported keychain | claude | 2026-09-25 | ✅ done |
+| 40 | `macos-release`: bundle path `fuego-wallet.app` → `fuego_wallet.app` (verify step failed every run); signing gated on never-set `env.APPLE_CERTIFICATE` → step output | claude | 2026-09-25 | ✅ done |
+| 41 | `scripts/sign-macos-app.sh`: one signer for CI (ad-hoc) and releases (keychain identity, hardened runtime, timestamp); CI re-sign no longer fails when optional `unified` is absent | claude | 2026-09-25 | ✅ done |
+| 42 | Stop duplicating macOS daemons into `Contents/Resources/bin` (never used; still pointed at Homebrew dylib paths) | claude | 2026-09-25 | ✅ done |
+| 43 | Linux executable is `Fuego Valise` (space). Flatpak `command: fuego_wallet` and snap `xfg-wallet` named nonexistent binaries, and snap split the exe from its `lib/`. Both now install the bundle intact under `fuego-valise/` with a `fuego-valise` launcher symlink; flatpak skips copying `.git`, `fuego-suite`, Rust `target` | claude | 2026-09-25 | ✅ done |
+| 44 | Flatpak/snap jobs → ubuntu-22.04 (snap `--destructive-mode` requires host = core22 base; oldest glibc); snap's stale `assets/bin` walletd part removed | claude | 2026-09-25 | ✅ done |
+| 45 | Wire test `get_random_outs_returns_known_output`: genesis coinbase key + amount from fuegod JSON must come back from `getrandom_outs.bin` with the global index `get_o_indexes.bin` reports — covers non-empty record layout and the `get_o_indexes` parser | claude | 2026-09-25 | ✅ done |
+| 46 | Delete `scripts/get_walletd_binary.sh`, `scripts/build-fuego-source.sh` (build suite walletd from `HEAT` into `assets/bin` under names nothing loads; unreferenced) | claude | 2026-09-25 | ✅ done |
 
 ### Sign-off
 
@@ -548,16 +234,16 @@ Defects found by the evals and verified, **not fixed** (recorded in the skill's 
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 25 | Add `usexfg/fuego-suite` as a shallow submodule at `fuego-suite/` tracking `master`, pinned to `524454d` | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 26 | `fuego-ffi/build.rs` compiles CryptoNight from `fuego-suite/src/crypto`; delete the vendored copy (`src/cn`, `src/Common`, 30 files, byte-identical to suite at the pin) | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 27 | Add CryptoNight known-answer tests to `fuego-ffi` (canonical CN v0 ×3, v2 ×2 from suite `tests/PowBytes`). The crate had zero tests before | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 28 | Delete `native/crypto` + `lib/native` (dead: `NativeCrypto` referenced nowhere, yet built and shipped in every APK/IPA; includes ~92 MB / 384 committed build artifacts) | claude-opus-5-5 | 2026-09-25 | ✅ done 2026-09-25 after user approval (task 35) |
-| 29 | Replace `xfgo/` paths (local name for suite) with `fuego-suite/` in `daemon_manager.dart`, `build-and-run.sh`, `test-daemon.sh`, comments | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 30 | Desktop CI builds fuegod/xfg-swapd/unified from the pinned submodule instead of cloning floating suite `master`; FFI jobs (mobile, fdroid) check out the submodule; macOS job rebuilds `libfuego_ffi.dylib` from it | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 31 | Dependabot `gitsubmodule` (daily): PR per suite master move | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 32 | `fuegod-wire-check` CI job + `fuego-sdk/tests/fuegod_wire.rs`: round-trip `queryblockslite.bin` and `getrandom_outs.bin` through a real fuegod built from the pin | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 33 | Fix found by #32: suite's KV serializer omits empty binary fields, and `parse_get_random_outs_response` / `parse_get_random_commitment_outs_response` treated that as a hard error, failing the whole call when any amount had no outputs. Absent field now means empty | claude-opus-5-5 | 2026-09-25 | ✅ done |
-| 34 | Fix CONTRIBUTING.md: told contributors to clone fuego-suite and check out stale `HEAT` | claude-opus-5-5 | 2026-09-25 | ✅ done |
+| 25 | Add `usexfg/fuego-suite` as a shallow submodule at `fuego-suite/` tracking `master`, pinned to `524454d` | claude | 2026-09-25 | ✅ done |
+| 26 | `fuego-ffi/build.rs` compiles CryptoNight from `fuego-suite/src/crypto`; delete the vendored copy (`src/cn`, `src/Common`, 30 files, byte-identical to suite at the pin) | claude | 2026-09-25 | ✅ done |
+| 27 | Add CryptoNight known-answer tests to `fuego-ffi` (canonical CN v0 ×3, v2 ×2 from suite `tests/PowBytes`). The crate had zero tests before | claude | 2026-09-25 | ✅ done |
+| 28 | Delete `native/crypto` + `lib/native` (dead: `NativeCrypto` referenced nowhere, yet built and shipped in every APK/IPA; includes ~92 MB / 384 committed build artifacts) | claude | 2026-09-25 | ✅ done 2026-09-25 after user approval (task 35) |
+| 29 | Replace `xfgo/` paths (local name for suite) with `fuego-suite/` in `daemon_manager.dart`, `build-and-run.sh`, `test-daemon.sh`, comments | claude | 2026-09-25 | ✅ done |
+| 30 | Desktop CI builds fuegod/xfg-swapd/unified from the pinned submodule instead of cloning floating suite `master`; FFI jobs (mobile, fdroid) check out the submodule; macOS job rebuilds `libfuego_ffi.dylib` from it | claude | 2026-09-25 | ✅ done |
+| 31 | Dependabot `gitsubmodule` (daily): PR per suite master move | claude | 2026-09-25 | ✅ done |
+| 32 | `fuegod-wire-check` CI job + `fuego-sdk/tests/fuegod_wire.rs`: round-trip `queryblockslite.bin` and `getrandom_outs.bin` through a real fuegod built from the pin | claude | 2026-09-25 | ✅ done |
+| 33 | Fix found by #32: suite's KV serializer omits empty binary fields, and `parse_get_random_outs_response` / `parse_get_random_commitment_outs_response` treated that as a hard error, failing the whole call when any amount had no outputs. Absent field now means empty | claude | 2026-09-25 | ✅ done |
+| 34 | Fix CONTRIBUTING.md: told contributors to clone fuego-suite and check out stale `HEAT` | claude | 2026-09-25 | ✅ done |
 
 ### Sign-off
 
@@ -824,39 +510,85 @@ build attempted. Recommended next step is a single-method spike (Phase
 - `cargo audit` + `flutter pub audit` + `actions/checkout@SHA` pin + `fuego-suite@tag` verify-commit (Supply Chain)
 - Raise `flutter test` coverage from 2% → 80% (see `PRODUCTION_AUDIT_REPORT.md` timeline)
 
----
+## [2026-10-04] Adversarial review pass on the merge — two test defects found and closed
 
-## 2026-10-13 — DeXFG local swap control and deployment hardening
-
-**Started**: 2026-10-13
-**Owner**: Codex
-**Status**: DONE
+Self-review of the merge above using the adversarial-review personas (Saboteur / New Hire / Security Auditor) plus the fuego-guardian checklists (crypto, wallet, 007 fail-secure, code quality). Both findings were in **my own tests**, not the production logic.
 
 | # | Task | Owner | Date | Status |
 |---|------|-------|------|--------|
-| 1 | Read the control token from a verified owner-only file for each local daemon request | Codex | 2026-10-13 | DONE |
-| 2 | Restrict daemon control to loopback and require the daemon's exact ready-chain key | Codex | 2026-10-13 | DONE |
-| 3 | Preserve swap amounts and rates with integer decimal conversion through the execution path | Codex | 2026-10-13 | DONE |
-| 4 | Require EVM RPC, chain ID, and HTLC registry data; reject unsupported testnet configuration | Codex | 2026-10-13 | DONE |
-| 5 | Validate decoded Solana program/keypair lengths and serialize XMR spend/view RPC configuration | Codex | 2026-10-13 | DONE |
-| 6 | Add typed confirmations for offer, request, accept, and refund actions | Codex | 2026-10-13 | DONE |
-| 7 | Run focused Flutter tests, static analysis, TUI tests, and daemon build/test targets | Codex | 2026-10-13 | DONE |
-| 8 | Require a control token before any TUI or DeXFG mutation request and correct bare IPv6 loopback URL construction | Codex | 2026-10-14 | DONE |
-| 9 | Match DeXFG AFK counterparty rounding to daemon floor settlement | Codex | 2026-10-14 | DONE |
-| 10 | Restrict SOL configuration to local RPC until authenticated remote transport exists | Codex | 2026-10-14 | DONE |
+| 120 | `commitments_found_on_legacy_accounts` did not assert attribution | opencode | 2026-10-04 | **Real defect, fixed.** It asserted only `c.len() == 2`, spendability and amounts. Proven vacuous by mutation: rewriting attribution to `OutputOwner::Primary` still passed. Now asserts `OutputOwner::LegacySubaddress(1)` per entry and re-verified to fail under the same mutation (`Some(Primary)` vs `Some(LegacySubaddress(1))`) |
+| 121 | Malformed attacker-controlled `commit_key` was untested | opencode | 2026-10-04 | Gap closed. Added `malformed_commit_keys_are_skipped_not_panicked`: 5 malformed keys (non-point, identity, low-order-ish, partial flag byte, non-canonical sign bit) through the full scan path, asserting no panic and no credit — plus a positive control so it cannot pass by the scanner ignoring commitments wholesale |
+| 122 | Guardian checklist: key zeroization | opencode | 2026-10-04 | PASS. `ScanKeys::drop` zeroizes `view_secret`, `spend_secret`, every `by_spend_key` secret, and both `legacy` secrets (`view_secret`, `spend_secret`) |
+| 123 | Guardian checklist: fail-secure on trust boundary | opencode | 2026-10-04 | PASS. `match hit { None => continue }` fails closed — a non-matching output is skipped, never misattributed |
+| 124 | Guardian checklist: dead code after refactor | opencode | 2026-10-04 | PASS. `derive_public_key` is still live in 4 key-output call sites, so the import is not dead. Build is warning-free |
+| 125 | Guardian checklist: balance underflow / arithmetic | opencode | 2026-10-04 | PASS. The patch introduces no amount arithmetic |
+| 126 | Refuted hypothesis: silent fund stranding | opencode | 2026-10-04 | `sweep_legacy_subaddresses` walks only `state.utxos`, so it cannot reach legacy HEAT — **but `select_heat` uses `heat_outputs()` with no owner filter**, so the funds are spendable through a normal HEAT send. Not a stranding bug |
+| 127 | Known cost characteristic | opencode | 2026-10-04 | The loop costs ~2 EC derivations per legacy account per commitment output, so scan time is O(outputs × registered legacy accounts). `register_legacy_subaddresses` has no batch cap. Pre-existing shape from Colin's version; this patch adds the second (legacy-form) attempt. Loopback-only RPC, so not remotely triggerable. Left unchanged rather than reordered late |
 
 ### Sign-off
 
-| Gate | Result |
-|------|--------|
-| Format | PASS — all task-owned Dart sources and tests formatted |
-| Flutter tests | PASS — client 16/16, configuration 9/9, and pair-drift 13/13 |
-| Flutter analyzer | INFO ONLY — 250 lint messages in the task-owned scope; no errors or warnings emitted |
-| TUI tests and build | PASS — `go test ./...`; `go build -o /private/tmp/fuego-tui-verify .` |
-| Daemon build/tests | PASS — service refuses no token; 13 config checks, 18 state checks, 446 price checks |
-| Funded testnet E2E | NOT RUN — real RPC/deployment metadata and funded accounts were not supplied |
-| All tasks done | DONE — local source gates passed; funded testnet evidence remains separate |
+| Check | Result |
+|-------|--------|
+| `cargo test --workspace` | ✅ **115 passed, 0 failed** |
+| `flutter test` | ✅ 72 passed, 0 failed |
+| `flutter analyze --no-pub --fatal-warnings --no-fatal-infos` | ✅ exit 0 |
+| Mutation check (attribution) | ✅ test fails `Some(Primary)` vs `Some(LegacySubaddress(1))` when attribution is broken; passes when correct |
+| Mutation check (vector data) | ✅ flipping one expected byte fails `crosscheck_ownerbound_vectors` |
+| Mutation check (patch removal) | ✅ `commitments_found_on_legacy_accounts` fails `0 vs 2` without the legacy loop |
+| Personas run | ⚠️ All three sub-agents and the guardian run failed on an opencode `FileSystem.writeFile` snapshot error. Personas were executed inline with direct command evidence instead; guardian loaded on retry and its checklists were applied |
+| All tasks done | Two real test defects found and closed; five guardian checks passed; one hypothesis refuted with evidence; one cost characteristic documented |
+| Scope | Tests and changelog only. No production logic changed in this pass |
 
-No testnet deployment identifiers, registry addresses, or RPC endpoints were
-invented. The UI refuses a testnet swap configuration without them. The browser
-dashboard remains read-only.
+## [2026-10-04] Second adversarial pass (multi-agent) — vacuous test fixed, scan cost bounded
+
+Ran the Saboteur and Security Auditor personas as independent sub-agents (read-only, via `git show`). Both returned findings; both were reproduced locally before being believed. **One of them caught a defect in my own previous fix.**
+
+| # | Task | Owner | Date | Status |
+|---|------|-------|------|--------|
+| 128 | `malformed_commit_keys_are_skipped_not_panicked` never entered the output loop | opencode | 2026-10-04 | **Real defect, fixed.** The fixture used `r = [7u8;32]` as the tx one-time pubkey. That is not a valid ed25519 point, so `generate_key_derivation` returned `None` and `scan_tx_prefix` returned *before* the output loop. All 5 assertions ran against a transaction rejected upstream. Rebuilt on a real `R = r*G`. Proof the loop is now reached: substituting a genuinely-owned commit key into slot 0 makes it fail `left: 500, right: 0` |
+| 129 | Unbounded legacy-subaddress registration is a scan-cost amplifier | opencode | 2026-10-04 | Fixed. `set_legacy_subaddresses` had no cap, and every registered account is walked per commitment output while each new index also schedules a full rescan. Added `MAX_LEGACY_SUBADDRESSES = 64` plus `legacy_registration_is_capped` |
+| 130 | Attempted lazy `legacy_derivations` | opencode | 2026-10-04 | **Reverted — it broke a pre-existing feature.** Gating the computation on "tx has a commitment output" made `legacy_subaddress_outputs_need_registration` fail, because the *key*-output arm uses the same vector. Reverted; cost is bounded by 128 instead. Comment left in place so the trap is not re-attempted |
+| 131 | Owner-bound scheme is absent from the pinned daemon | opencode | 2026-10-04 | **CRITICAL, pre-existing, NOT fixed here — needs a decision.** `fuego-suite @ a36eccb5` has zero occurrences of `owner_bound`; the only commitment derivation in the daemon is `deriveCommitmentKeys` (`TransactionExtra.cpp:1750`), and the only discovery rule is `TransfersConsumer.cpp:124`. A `keyderiv` branch exists on the submodule origin at `0925d64c` but is **not** the pin. See the escalation note below |
+
+### Escalation — read before enabling HEAT/CD sends to a counterparty
+
+`transaction_builder.rs` emits `P = B + Hs(D,i)·G` for commitment outputs. The pinned daemon has no matching discovery rule, so **a counterparty wallet using the pinned daemon will not find those outputs**. The vector suites assert agreement with a C++ implementation of a function that exists only on the unpinned `keyderiv` branch, so they prove Rust/Rust agreement, not protocol agreement. Pre-existing since `b8b0e93`, but the merge entrenches it by adding a scanner arm and three suites that make the form look protocol-blessed. Options: pin the submodule to `keyderiv`, or revert commitment creation to `deriveCommitmentKeys` until the daemon ships a discovery rule. **Not decided or changed here.**
+
+### Sign-off
+
+| Check | Result |
+|-------|--------|
+| `cargo test --workspace` | ✅ **116 passed, 0 failed** |
+| `cargo build -p fuego-sdk` | ✅ clean, no warnings |
+| Fixture non-vacuity | ✅ owned-key substitution fails `500 vs 0` |
+| Cap enforced | ✅ 4,998-index flood stops at 64 |
+| Reverted-optimization check | ✅ `legacy_subaddress_outputs_need_registration` passes again |
+| Personas | ⚠️ Saboteur and Security Auditor ran as independent sub-agents. The New Hire persona was not re-run (three parallel agents previously died on an opencode snapshot error); disk was at 97% and 3.1 GB of scratch was reclaimed first |
+| All tasks done | Two defects fixed and verified; one optimization attempted and reverted after it broke a test; one CRITICAL escalated, not fixed |
+| Scope | `scanner.rs` tests + one const. No production behaviour changed except the registration cap |
+
+## [2026-10-04] Config-gate commitment derivation, default OFF (closes the pinned-daemon CRITICAL)
+
+Decision taken: gate the owner-bound derivation behind an env flag, default OFF. `FUEGO_OWNER_BOUND_COMMITMENTS=1` opts in.
+
+| # | Task | Owner | Date | Status |
+|---|------|-------|------|--------|
+| 139 | Gate commitment-key creation, default OFF | opencode | 2026-10-04 | Done. `commitment_key()` branches on an `AtomicBool` (default `false`). OFF emits `derive_commitment_keys(derive_deposit_secret(D, i))` — the form the pinned daemon discovers. ON emits `derive_owner_bound_commit_key` |
+| 140 | Deliberately avoid `derive_commitment_output_key(_, _, None)` | opencode | 2026-10-04 | Its doc says "`None` means a hard failure" while its body silently returns the legacy key, so the wrong contract wins by construction. Replaced with two explicit branches and no `Option` |
+| 141 | Env plumbing + operator visibility | opencode | 2026-10-04 | `init_owner_bound_commitments_from_env()` called from `main()`; logs `warn!` when ON, naming the reason |
+| 142 | Scanner keeps matching both forms | opencode | 2026-10-04 | Unchanged by design. Owner-bound first, legacy fallback, plus legacy accounts under their own derivation. Matching is free readiness, so enabling the gate later cannot orphan our own outputs |
+| 143 | Split `phase7_vectors` by mode | opencode | 2026-10-04 | Four tests whose cross-language hashes were verified against `parseAndValidate` now run under `with_owner_bound(..)`. Added `commitment_creation_defaults_to_the_interoperable_derivation` to pin the default |
+| 144 | Corrected the evidence behind the CRITICAL | opencode | 2026-10-04 | I had analysed `a36eccb5`, which is merely what sits in the working tree. **All branches pin `524454d`**, and `a36eccb5` is 1,255 commits ahead. Re-checked at the real pin: `owner_bound` still absent, `deriveCommitmentKeys` still the only derivation. Conclusion unchanged, evidence was wrong |
+
+### Sign-off
+
+| Check | Result |
+|-------|--------|
+| `cargo test --workspace` | ✅ **117 passed, 0 failed** |
+| `flutter test` | ✅ 72 passed, 0 failed |
+| `flutter analyze --no-pub --fatal-warnings --no-fatal-infos` | ✅ exit 0 |
+| Gate negative control (default flag) | ✅ flipping `AtomicBool::new(false)` → `new(true)` fails "the shipped default must be the interoperable legacy derivation" |
+| Gate negative control (derivation) | ✅ forcing `commitment_key` owner-bound while the flag reads false fails "default derivation must be the interoperable legacy form" — two independent assertions |
+| `owner_bound` at the real pin `524454d` | ✅ absent; `deriveCommitmentKeys` present in `TransactionExtra.cpp`, `TransfersConsumer.cpp`, `WalletGreen.cpp` |
+| All tasks done | Gate implemented, tested both ways, documented in `AGENTS.md`, verified green |
+| Scope | `transaction_builder.rs`, `main.rs`, `phase7_vectors.rs`, `AGENTS.md`, this file. No scanner behaviour change |

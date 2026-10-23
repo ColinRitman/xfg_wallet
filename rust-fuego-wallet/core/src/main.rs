@@ -69,17 +69,14 @@ enum Commands {
         #[arg(long)]
         await_wallet: bool,
 
-        /// File holding the bearer token that callers must present as
-        /// `Authorization: Bearer <token>`. Passed by path, never by argv, so
-        /// the token does not appear in the process list. When omitted, no
-        /// token is required and the API is reachable by any local process.
+        /// Path to a file containing the bearer token for walletd HTTP auth.
         #[arg(long)]
         auth_token_file: Option<PathBuf>,
     },
     Status,
 }
 
-/// Read the bearer token from `path`, trimming trailing whitespace.
+
 pub fn read_auth_token_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
     Ok(raw.trim().to_string())
@@ -117,6 +114,19 @@ fn load_or_create_seed(wallet_dir: &PathBuf) -> Result<[u8; 32], Box<dyn std::er
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Commitment-output derivation is gated and defaults OFF, which is what
+    // keeps us interoperable with the pinned daemon (it only discovers the
+    // legacy form). Log the resolved value so an operator who set the env var
+    // can confirm it took effect.
+    fuego_sdk::transaction_builder::init_owner_bound_commitments_from_env();
+    if fuego_sdk::transaction_builder::owner_bound_commitments_enabled() {
+        log::warn!(
+            "FUEGO_OWNER_BOUND_COMMITMENTS is ON: HEAT/CD outputs will use the owner-bound \
+             derivation, which the pinned daemon cannot discover. Only enable this against a \
+             daemon that ships a matching discovery rule (suite `keyderiv`)."
+        );
+    }
 
     let cli = Cli::parse();
     let wallet_dir = default_wallet_dir();
@@ -219,16 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 4. Start Axum server
-            let bind = format!("{}:{}", cli.host, cli.port);
             let auth_token = match &auth_token_file {
                 Some(p) => Some(read_auth_token_file(p)?),
                 None => None,
             };
             if auth_token.is_none() {
-                log::warn!(
-                    "no --auth-token-file: every local process can call this API unauthenticated"
-                );
+                log::warn!("walletd running without auth token; any local process can reach it");
             }
+            let bind = format!("{}:{}", cli.host, cli.port);
             server::run_server(slot, &daemon_url, &bind, auth_token).await?;
         }
 
