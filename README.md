@@ -291,3 +291,4 @@ Fuogo Valise is provided "as is" without warranty. Cryptocurrency transactions a
 <p align="center">
   <strong> Built with 🔥 for The Fuego Mob</strong>
 </p>  
+# CI trigger
