@@ -1,0 +1,1436 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+
+import 'daemon_event_bus.dart';
+import 'security_service.dart';
+import 'walletd_auth.dart';
+import '../models/network_config.dart';
+
+/// Unifyd process manager for all backend daemons.
+///
+/// Manages the unifyd daemon: an in-process node (CryptoNoteCore + P2P) and
+/// the wallet container service in one binary. It is an alternative to
+/// fuego_walletd, not a wrapper around it, and it does not launch xfg-swapd.
+/// Default ports: fuegod=18180, walletd=18189, swapd=18902.
+class DaemonManager {
+  // ── Ports (configurable per network) ──────────────────────────────
+  int fuegodPort;
+  int walletdPort;
+  int swapdPort;
+
+  DaemonManager({NetworkConfig? config})
+    : fuegodPort = config?.daemonRpcPort ?? 18180,
+      walletdPort = config?.walletRpcPort ?? 18189,
+      swapdPort = 18902;
+
+  // ── Process handles ──────────────────────────────────────────────
+  Process? _unifyd;
+  Process? _fuegod;
+  Process? _walletd;
+  Process? _swapd;
+
+  // ── External daemon detection (when user started daemons manually) ─
+  bool _walletdExternallyRunning = false;
+  bool _fuegodExternallyRunning = false;
+  bool _swapdExternallyRunning = false;
+
+  // ── Binary paths ─────────────────────────────────────────────────
+  String? _fuegodBin;
+  String? _walletdBin;
+  String? _swapdBin;
+
+  // ── Android native library directory ────────────────────────────
+  // Android has no subprocess-executable concept outside jniLibs — an
+  // arbitrary bundled binary only becomes executable once extracted to
+  // applicationInfo.nativeLibraryDir (see MainActivity.kt). Resolved once
+  // per DaemonManager instance and cached; Dart has no built-in accessor
+  // for this path, hence the platform channel.
+  static const MethodChannel _nativeLibChannel = MethodChannel(
+    'com.fuego.fuego_wallet/native_lib_dir',
+  );
+  String? _androidNativeLibDir;
+  bool _androidNativeLibDirResolved = false;
+
+  Future<void> _resolveAndroidNativeLibDir() async {
+    if (!Platform.isAndroid || _androidNativeLibDirResolved) return;
+    _androidNativeLibDirResolved = true;
+    try {
+      _androidNativeLibDir = await _nativeLibChannel.invokeMethod<String>(
+        'getNativeLibraryDir',
+      );
+      debugPrint('[daemon] Android nativeLibraryDir: $_androidNativeLibDir');
+    } catch (e) {
+      debugPrint('[daemon] Failed to resolve Android nativeLibraryDir: $e');
+    }
+  }
+
+  // ── State ────────────────────────────────────────────────────────
+  final List<String> errors = [];
+  final ValueNotifier<DaemonStatus> status = ValueNotifier(DaemonStatus());
+
+  /// Mode of the last [startAll] — used to interpret walletd health
+  /// (local mode requires an embedded fuegod; remote does not).
+  bool _useLocalNode = true;
+
+  /// True while [stopAll]/[stopSwapd] is tearing processes down — suppresses
+  /// the xfg-swapd auto-restart so intentional stops don't respawn.
+  bool _stopping = false;
+
+  /// Config path used for the last C++ swapd start; preserved for crash-restarts.
+  String? _lastSwapdConfigPath;
+
+  /// Bounded stderr buffer captured during unifyd daemon startup
+  /// (release mode) so failures surface the real cause, not just the
+  /// exit code (e.g. "Address already in use").
+  StringBuffer? _unifiedExitLog;
+
+  /// Unifyd event bus — single source of truth for daemon health.
+  final DaemonEventBus eventBus = DaemonEventBus();
+
+  /// Human-readable error from last `startAll()` call.
+  String? _lastStartError;
+  String? get lastStartError => _lastStartError;
+
+  /// Detailed per-daemon startup error messages.
+  final Map<String, String> daemonErrors = {};
+
+  // ── Lifecycle ────────────────────────────────────────────────────
+
+  /// Kill any Fuego-owned process occupying [port], then return the freed port.
+  /// Returns error message if port is occupied and cannot be freed.
+  /// Safety: verifies PID is a Fuego daemon before SIGKILL to avoid killing
+  /// unrelated system/user processes that happen to hold the port.
+  Future<String?> _freePort(int port) async {
+    final pid = await _findPidOnPort(port);
+    if (pid == null) return null;
+
+    // Safety rails: never kill init/system processes.
+    if (pid <= 1 || pid < 100) {
+      return 'Port $port is occupied by system PID $pid — refusing to kill';
+    }
+
+    if (!await _isFuegoPid(pid)) {
+      debugPrint(
+        '[daemon] Port $port held by PID $pid (non-Fuego) — not killing',
+      );
+      return 'Port $port is occupied by PID $pid (non-Fuego process) — '
+          'stop that process or choose a different port';
+    }
+
+    // TOCTOU re-check: PID may have died and been reused between ps and kill
+    final recheck = await _findPidOnPort(port);
+    if (recheck != pid) {
+      debugPrint(
+        '[daemon] Port $port PID changed $pid->$recheck during verify — aborting kill',
+      );
+      return 'Port $port holder changed during verification — retry';
+    }
+
+    debugPrint(
+      '[daemon] Port $port in use by PID $pid — killing (verified Fuego)',
+    );
+    final killed = await _killPid(pid);
+    if (!killed)
+      return 'Port $port is occupied by PID $pid and could not be killed';
+
+    // Wait for port to be released
+    for (var i = 0; i < 10; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (await _findPidOnPort(port) == null) return null;
+    }
+    return 'Port $port was occupied by PID $pid — killed but port not yet released';
+  }
+
+  /// True if [pid] looks like a Fuego daemon (fuegod, fuego_walletd, xfg-swapd,
+  /// unifyd) by inspecting `ps -o comm=` / `args` or Windows `wmic`/`tasklist`.
+  /// Returns false on unknown/unreadable (fail-closed: do not kill).
+  /// Single-ps-then-recheck pattern mitigates TOCTOU; caller should re-verify
+  /// PID still holds port before kill.
+  Future<bool> _isFuegoPid(int pid) async {
+    try {
+      if (Platform.isWindows) {
+        // Fail-closed on Windows: verify via wmic/tasklist, not blind true.
+        try {
+          final r = await Process.run('wmic', [
+            'process',
+            'where',
+            'ProcessId=$pid',
+            'get',
+            'CommandLine',
+            '/format:list',
+          ]);
+          final out = (r.stdout as String).toLowerCase();
+          if (out.contains('fuego') ||
+              out.contains('walletd') ||
+              out.contains('swapd') ||
+              out.contains('unifyd') ||
+              out.contains('fuegod')) {
+            return true;
+          }
+        } catch (_) {}
+        try {
+          final r2 = await Process.run('tasklist', [
+            '/FI',
+            'PID eq $pid',
+            '/FO',
+            'CSV',
+            '/NH',
+          ]);
+          final out2 = (r2.stdout as String).toLowerCase();
+          if (out2.contains('fuego') ||
+              out2.contains('walletd') ||
+              out2.contains('swapd') ||
+              out2.contains('unifyd')) {
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      }
+      // Unix: single snapshot — prefer comm, fallback to args; require exact basename or path segment, not substring.
+      final comm = await Process.run('ps', [
+        '-o',
+        'comm=',
+        '-p',
+        pid.toString(),
+      ]);
+      final commStr = (comm.stdout as String).trim().toLowerCase();
+      final commBase = commStr.split('/').last.split(' ').first;
+      const allowed = {
+        'fuegod',
+        'fuego_walletd',
+        'fuego-walletd',
+        'xfg-swapd',
+        'swapd',
+        'unifyd',
+      };
+      if (allowed.contains(commBase)) return true;
+      final args = await Process.run('ps', [
+        '-o',
+        'args=',
+        '-p',
+        pid.toString(),
+      ]);
+      final argsStr = (args.stdout as String).toLowerCase();
+      // Check for path segments like /fuegod or /unifyd to avoid 'notfuego' false positive
+      if (argsStr.contains('/fuegod') ||
+          argsStr.contains('/fuego_walletd') ||
+          argsStr.contains('/xfg-swapd') ||
+          argsStr.contains('/unifyd') ||
+          argsStr.contains(' fuegod ') ||
+          argsStr.contains(' unifyd ')) {
+        return true;
+      }
+      return allowed.any((a) => argsStr.contains(a) && argsStr.contains('/$a'));
+    } catch (e) {
+      debugPrint('[daemon] _isFuegoPid ps failed for $pid: $e');
+      return false;
+    }
+  }
+
+  /// Find PID of process listening on [port].
+  Future<int?> _findPidOnPort(int port) async {
+    try {
+      if (Platform.isMacOS || Platform.isLinux) {
+        final result = await Process.run('lsof', [
+          '-ti',
+          ':$port',
+          '-sTCP:LISTEN',
+        ]);
+        final output = (result.stdout as String).trim();
+        if (output.isNotEmpty) {
+          final pid = int.tryParse(output.split('\n').first);
+          if (pid != null && pid > 0) return pid;
+        }
+      } else if (Platform.isWindows) {
+        final result = await Process.run('netstat', ['-ano']);
+        final lines = (result.stdout as String).split('\n');
+        for (final line in lines) {
+          if (line.contains(':$port') && line.contains('LISTENING')) {
+            final parts = line.trim().split(RegExp(r'\s+'));
+            if (parts.isNotEmpty) {
+              final pid = int.tryParse(parts.last);
+              if (pid != null && pid > 0) return pid;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Kill a process by PID.
+  Future<bool> _killPid(int pid) async {
+    try {
+      if (Platform.isWindows) {
+        final result = await Process.run('taskkill', [
+          '/F',
+          '/PID',
+          pid.toString(),
+        ]);
+        return result.exitCode == 0;
+      } else {
+        Process.killPid(pid, ProcessSignal.sigkill);
+        // Wait briefly and verify
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        return !Process.killPid(pid); // returns false if process is gone
+      }
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ── Binary discovery ─────────────────────────────────────────────
+
+  String? _findUnifydBinary() {
+    final exe = File(Platform.resolvedExecutable);
+    final candidates = [
+      '${exe.parent.path}/unifyd',
+      if (Platform.isMacOS)
+        '${exe.parent.parent.parent.path}/Resources/bin/unifyd',
+      '${Directory.current.path}/fuego-suite/build/src/unifyd',
+      '${Directory.current.path}/fuego-suite/build/release/src/unifyd',
+    ];
+    for (final path in candidates) {
+      if (File(path).existsSync()) return path;
+    }
+    return null;
+  }
+
+  String? _findFuegodBinary() {
+    if (_fuegodBin != null && File(_fuegodBin!).existsSync()) return _fuegodBin;
+    final exe = File(Platform.resolvedExecutable);
+    final candidates = [
+      '${exe.parent.path}/fuegod',
+      if (Platform.isMacOS)
+        '${exe.parent.parent.parent.path}/Resources/bin/fuegod',
+      '${Directory.current.path}/rust-fuego-wallet/target/release/fuegod',
+      '${Directory.current.path}/rust-fuego-wallet/target/debug/fuegod',
+      '${Directory.current.path}/fuego-suite/build/src/fuegod',
+    ];
+    for (final path in candidates) {
+      if (File(path).existsSync()) {
+        _fuegodBin = path;
+        return path;
+      }
+    }
+    return null;
+  }
+
+  String? _findWalletdBinary() {
+    if (_walletdBin != null && File(_walletdBin!).existsSync())
+      return _walletdBin;
+    final exe = File(Platform.resolvedExecutable);
+    final candidates = [
+      // Android: bundled as jniLibs/*/libfuego_walletd.so, extracted to
+      // nativeLibraryDir with execute permission (see MainActivity.kt /
+      // _resolveAndroidNativeLibDir). Not a real shared library — invoked
+      // directly as a subprocess, never dlopen()'d.
+      if (Platform.isAndroid && _androidNativeLibDir != null)
+        '$_androidNativeLibDir/libfuego_walletd.so',
+      '${exe.parent.path}/fuego_walletd',
+      if (Platform.isMacOS)
+        '${exe.parent.parent.parent.path}/Resources/bin/fuego_walletd',
+      // Prefer release over debug for correct --local / port defaults.
+      '${Directory.current.path}/rust-fuego-wallet/target/release/fuego_walletd',
+      '${Directory.current.path}/rust-fuego-wallet/target/debug/fuego_walletd',
+      '${Directory.current.path}/fuego-suite/build/src/walletd',
+    ];
+    for (final path in candidates) {
+      if (File(path).existsSync()) {
+        _walletdBin = path;
+        return path;
+      }
+    }
+    return null;
+  }
+
+  String? _findSwapdBinary() {
+    if (_swapdBin != null && File(_swapdBin!).existsSync()) return _swapdBin;
+    final exe = File(Platform.resolvedExecutable);
+    final candidates = [
+      '${exe.parent.path}/xfg-swapd',
+      if (Platform.isMacOS)
+        '${exe.parent.parent.parent.path}/Resources/bin/xfg-swapd',
+      '${Directory.current.path}/fuego-suite/swapxfg/xfg-swapd',
+      '${Directory.current.path}/fuego-suite/build/release/bin/xfg-swapd',
+      '${Directory.current.path}/build/release/src/xfg-swapd',
+      '${Directory.current.path}/xfg-swapd',
+      '${Directory.current.path}/fuego-suite/build/src/xfg-swapd',
+      '${Directory.current.path}/fuego-suite/build/release/src/xfg-swapd',
+    ];
+    for (final path in candidates) {
+      if (File(path).existsSync()) {
+        _swapdBin = path;
+        return path;
+      }
+    }
+    return null;
+  }
+
+  /// True when binary is the Go swapxfg headless control API (not C++ --service).
+  bool _isGoSwapd(String binary) {
+    final name = p.basename(binary).toLowerCase();
+    if (name == 'swapxfg') return true;
+    // Built Go binary is often named xfg-swapd but rejects --service.
+    return binary.contains('${p.separator}swapxfg${p.separator}');
+  }
+
+  // ── Health checks ────────────────────────────────────────────────
+
+  Future<bool> _checkHealth(
+    String url, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final result = await _checkHealthDetailed(url, timeout: timeout);
+    return result.ok;
+  }
+
+  Future<_HealthResult> _checkHealthDetailed(
+    String url, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final client = HttpClient()..connectionTimeout = timeout;
+    try {
+      final req = await client.getUrl(Uri.parse(url));
+      final uri = Uri.parse(url);
+      final loopback =
+          uri.host == '127.0.0.1' ||
+          uri.host == 'localhost' ||
+          uri.host == '::1';
+      final healthToken = WalletdAuth.token;
+      if (loopback && healthToken != null && healthToken.isNotEmpty) {
+        req.headers.set('Authorization', 'Bearer $healthToken');
+      }
+      final resp = await req.close().timeout(timeout);
+      await resp.drain<void>();
+      if (resp.statusCode == 200) return _HealthResult.ok();
+      return _HealthResult.error('HTTP ${resp.statusCode}');
+    } on SocketException catch (e) {
+      if (e.osError?.errorCode == 61 ||
+          e.message.contains('Connection refused')) {
+        return _HealthResult.error('Connection refused');
+      }
+      if (e.osError?.errorCode == 60 ||
+          e.message.contains('ETIMEDOUT') ||
+          e.message.contains('timed out')) {
+        return _HealthResult.error('Connection timed out');
+      }
+      return _HealthResult.error(
+        e.message.length > 80 ? '${e.message.substring(0, 77)}...' : e.message,
+      );
+    } on TimeoutException {
+      return _HealthResult.error('Connection timed out');
+    } catch (e) {
+      final msg = e.toString();
+      return _HealthResult.error(
+        msg.length > 80 ? '${msg.substring(0, 77)}...' : msg,
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _updateStatus() async {
+    final walletdHealth = await _checkHealthDetailed(
+      'http://127.0.0.1:$walletdPort/health',
+    );
+    // Prefer /health; some builds only expose JSON-RPC.
+    final walletdOk =
+        walletdHealth.ok ||
+        (await _checkHealthDetailed(
+          'http://127.0.0.1:$walletdPort/json_rpc',
+        )).ok;
+
+    final fuegodHealth = await _checkHealthDetailed(
+      'http://127.0.0.1:$fuegodPort/getinfo',
+    );
+    final swapdHealth = await _checkHealthDetailed(
+      'http://127.0.0.1:$swapdPort/health',
+    );
+
+    final fuegodOk = fuegodHealth.ok;
+    final swapdOk = swapdHealth.ok;
+
+    // Proxy (walletd/unifyd) is the critical process. Embedded fuegod is
+    // managed by --local and may not expose 18180 until fully synced.
+    final proxyAlive =
+        _unifyd != null || _walletd != null || _walletdExternallyRunning;
+    final proxyHealthy = proxyAlive && walletdOk;
+
+    // Local mode: the chain IS the embedded fuegod — it must answer on the
+    // fuegod port. Remote mode: chain is the seed node, walletd healthy is
+    // enough.
+    final chainOk = _useLocalNode ? fuegodOk : true;
+
+    status.value = DaemonStatus(
+      fuegodRunning:
+          (_fuegod != null && fuegodOk) ||
+          (_unifyd != null && proxyHealthy) ||
+          (_walletd != null && proxyHealthy && chainOk) ||
+          (_walletdExternallyRunning && fuegodOk) ||
+          _fuegodExternallyRunning,
+      walletdRunning: proxyHealthy || _walletdExternallyRunning,
+      swapdRunning:
+          (_swapd != null || _unifyd != null || _swapdExternallyRunning) &&
+          swapdOk,
+      fuegodError:
+          daemonErrors['fuegod'] ??
+          ((_fuegod != null || (_useLocalNode && _walletd != null)) && !fuegodOk
+              ? fuegodHealth.error
+              : null),
+      walletdError:
+          daemonErrors['walletd'] ??
+          (proxyAlive && !walletdOk ? walletdHealth.error : null),
+      swapdError:
+          daemonErrors['swapd'] ??
+          ((_swapd != null || _swapdExternallyRunning) && !swapdOk
+              ? swapdHealth.error
+              : null),
+    );
+  }
+
+  // ── Start all daemons ────────────────────────────────────────────
+
+  /// Start backend daemons.
+  ///
+  /// **Local mode** (`useLocalNode: true`):
+  ///   fuego_walletd serve --local  (embeds/spawns fuegod itself)
+  ///
+  /// **Remote mode** (`useLocalNode: false`):
+  ///   fuego_walletd serve --daemon-host [daemonHost] --daemon-port [daemonPort]
+  ///   Does NOT start a local fuegod — the proxy talks to the remote seed node.
+  ///
+  /// Swap daemon:
+  /// - Go headless (`fuego-suite/swapxfg/xfg-swapd --headless`) when that binary is found
+  /// - else C++ style `--swap-config … --service` when [swapConfigPath] is set
+  ///
+  /// Returns error message if the wallet proxy fails, null on success.
+  Future<String?> startAll({
+    bool useLocalNode = true,
+    bool useTestnet = false,
+    String? swapConfigPath,
+    String daemonHost = '127.0.0.1',
+    int daemonPort = 18180,
+    bool startSwapd = true,
+  }) async {
+    errors.clear();
+    daemonErrors.clear();
+    _lastStartError = null;
+    _walletdExternallyRunning = false;
+    _fuegodExternallyRunning = false;
+    _swapdExternallyRunning = false;
+    _useLocalNode = useLocalNode;
+    await _resolveAndroidNativeLibDir();
+    debugPrint('[daemon] === Starting daemons ===');
+    debugPrint('[daemon] Mode: ${useLocalNode ? "LOCAL" : "REMOTE"}');
+    debugPrint('[daemon] Chain target: $daemonHost:$daemonPort');
+    debugPrint('[daemon] Testnet: $useTestnet');
+    await _updateStatus();
+
+    String? walletdErr;
+    String? swapdErr;
+
+    // ── 0. Try unifyd daemon first (desktop bundles) ──
+    final unifydBin = _findUnifydBinary();
+    if (unifydBin != null) {
+      debugPrint('[daemon] Found unifyd daemon: $unifydBin');
+      try {
+        walletdErr = await _startUnifyd(
+          unifydBin,
+          useLocalNode: useLocalNode,
+          useTestnet: useTestnet,
+          daemonHost: daemonHost,
+          daemonPort: daemonPort,
+        );
+      } catch (e) {
+        walletdErr = e.toString();
+        debugPrint('[daemon] Unifyd daemon crashed: $e');
+      }
+      if (walletdErr == null) {
+        debugPrint('[daemon] Unifyd daemon started OK on port $walletdPort');
+      } else {
+        debugPrint(
+          '[daemon] Unifyd daemon failed ($walletdErr), falling back...',
+        );
+      }
+    } else {
+      debugPrint(
+        '[daemon] Unifyd daemon binary not found — using fuego_walletd',
+      );
+    }
+
+    // ── 1. Never spawn a separate fuegod here ──
+    // Local:  fuego_walletd --local owns embedded fuegod.
+    // Remote: chain is the remote seed node — local fuegod would fight ports
+    //         and break the remote path (this was the inverted-logic bug).
+
+    // ── 2. fuego_walletd (wallet JSON-RPC proxy — required) ──
+    if (walletdErr != null || unifydBin == null) {
+      walletdErr = await _startWalletd(
+        useLocalNode: useLocalNode,
+        useTestnet: useTestnet,
+        daemonHost: useLocalNode ? '127.0.0.1' : daemonHost,
+        daemonPort: useLocalNode ? fuegodPort : daemonPort,
+      );
+      if (walletdErr != null) {
+        errors.add('fuego_walletd: $walletdErr');
+        daemonErrors['walletd'] = walletdErr;
+        _lastStartError = 'walletd: $walletdErr';
+      }
+    }
+
+    // ── 3. xfg-swapd (required for full stack; soft-fail with error recorded) ──
+    if (startSwapd) {
+      final chainHost = useLocalNode ? '127.0.0.1' : daemonHost;
+      final chainPort = useLocalNode ? fuegodPort : daemonPort;
+      swapdErr = await _startSwapd(
+        configPath: swapConfigPath,
+        chainHost: chainHost,
+        chainPort: chainPort,
+        walletPort: walletdPort,
+        useTestnet: useTestnet,
+      );
+      if (swapdErr != null) {
+        errors.add('xfg-swapd: $swapdErr');
+        daemonErrors['swapd'] = swapdErr;
+        debugPrint('[daemon] xfg-swapd failed (non-fatal): $swapdErr');
+      }
+    }
+
+    await _updateStatus();
+
+    // Always start event bus so externally-started daemons are detected
+    eventBus.start(
+      fuegodPort: useLocalNode ? fuegodPort : daemonPort,
+      walletdPort: walletdPort,
+      swapdPort: swapdPort,
+      fuegodHost: useLocalNode ? '127.0.0.1' : daemonHost,
+    );
+
+    return walletdErr;
+  }
+
+  Future<String?> _startFuegod({bool useTestnet = false}) async {
+    // Detect externally-started fuegod
+    final alreadyRunning = await _checkHealth(
+      'http://127.0.0.1:$fuegodPort/getinfo',
+      timeout: const Duration(seconds: 2),
+    );
+    if (alreadyRunning) {
+      _fuegodExternallyRunning = true;
+      debugPrint('[daemon] fuegod already running on port $fuegodPort');
+      return null;
+    }
+
+    final binary = _findFuegodBinary();
+    if (binary == null) return 'fuegod binary not found';
+
+    // Kill stale process on port
+    final portErr = await _freePort(fuegodPort);
+    if (portErr != null) return portErr;
+
+    final dataDir = '${Directory.current.path}/fuegod_data';
+    await Directory(dataDir).create(recursive: true);
+
+    final args = [
+      '--data-dir', dataDir,
+      '--rpc-bind-port', fuegodPort.toString(),
+      '--rpc-bind-ip', '127.0.0.1',
+      '--log-level', '1',
+      // Headless: no TTY on stdin when spawned from the GUI.
+      '--no-console',
+    ];
+    if (useTestnet) args.add('--testnet');
+
+    try {
+      debugPrint('[daemon] Starting fuegod: $binary');
+      _fuegod = await Process.start(binary, args);
+      _fuegod!.stdout.drain<void>();
+      _fuegod!.stderr.drain<void>();
+      _fuegod!.exitCode.then((code) {
+        debugPrint('[daemon] fuegod exited with code $code');
+        _fuegod = null;
+      });
+    } catch (e) {
+      return 'Failed to spawn: $e';
+    }
+
+    // Wait for ready
+    for (var i = 0; i < 30; i++) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (await _checkHealth(
+        'http://127.0.0.1:$fuegodPort/getinfo',
+        timeout: const Duration(seconds: 2),
+      )) {
+        debugPrint('[daemon] fuegod ready on port $fuegodPort');
+        return null;
+      }
+    }
+    return 'fuegod not ready after 60s';
+  }
+
+  Future<String?> _startWalletd({
+    bool useLocalNode = true,
+    bool useTestnet = false,
+    String daemonHost = '127.0.0.1',
+    int daemonPort = 18180,
+  }) async {
+    final binary = _findWalletdBinary();
+    if (binary == null) {
+      return 'fuego_walletd binary not found '
+          '(searched app bundle + rust-fuego-wallet/target/{release,debug})';
+    }
+
+    // Load before the probes below: they talk to walletd, which rejects an
+    // unauthenticated call, and a probe that 401s makes the app kill a healthy
+    // walletd it started on the previous run.
+    await WalletdAuth.load();
+
+    // Detect externally-started walletd
+    final alreadyRunning =
+        await _probeJsonRpcReady(walletdPort) ||
+        await _checkHealth(
+          'http://127.0.0.1:$walletdPort/health',
+          timeout: const Duration(seconds: 2),
+        );
+    if (alreadyRunning) {
+      // In local mode the walletd must be running with an embedded fuegod.
+      // A stale walletd from a previous app instance (older binary, remote
+      // args, or a dead embedded daemon) answers /health with fuego:false
+      // and leaves the chain port 18180 dead — killing the whole stack
+      // (swapd, mining, balances). Verify the embedded daemon before reuse.
+      // A walletd from an older app version has no open_wallet and serves a
+      // wallet of its own (master_seed.bin), not the vault: replace it too.
+      final staleBinary = !await _walletdHasWalletSlot(walletdPort);
+      if (staleBinary) {
+        debugPrint(
+          '[daemon] walletd on $walletdPort predates open_wallet — restarting',
+        );
+        final killErr = await _freePort(walletdPort);
+        if (killErr != null) return killErr;
+      } else if (useLocalNode && !await _walletdEmbeddedFuegodOk(walletdPort)) {
+        debugPrint(
+          '[daemon] walletd on $walletdPort is stale '
+          '(embedded fuegod offline) — killing and restarting',
+        );
+        final killErr = await _freePort(walletdPort);
+        if (killErr != null) return killErr;
+      } else {
+        _walletdExternallyRunning = true;
+        debugPrint(
+          '[daemon] fuego_walletd already running on port $walletdPort',
+        );
+        return null;
+      }
+    }
+
+    final portErr = await _freePort(walletdPort);
+    if (portErr != null) return portErr;
+
+    // In local mode the Rust backend spawns fuegod on daemonPort (18180).
+    // A stale fuegod from a previous app instance would otherwise block it
+    // or get silently reused with stale data.
+    if (useLocalNode) {
+      final chainPortErr = await _freePort(daemonPort);
+      if (chainPortErr != null) return chainPortErr;
+    }
+
+    // clap: -P/--port global, then serve subcommand flags
+    final args = <String>[
+      '-P', walletdPort.toString(),
+      'serve',
+      '--daemon-host', daemonHost,
+      '--daemon-port', daemonPort.toString(),
+      // No wallet until the vault is unlocked; WalletCubit hands over its seed.
+      '--await-wallet',
+    ];
+    if (useTestnet) args.add('--testnet');
+    if (useLocalNode) args.add('--local');
+
+    // Bearer token for the walletd API. Any local process can otherwise call
+    // every method while a wallet is open; on Android any app with network
+    // permission can reach 127.0.0.1. The token is passed by path, never by
+    // argv, so it does not show up in the process list (CWE-214), matching how
+    // the container password is already handled.
+    //
+    // Loading first and writing the same value means the file walletd reads and
+    // the value the HTTP clients present cannot drift.
+    try {
+      final authTokenFile = await WalletdAuth.tokenFilePath();
+      final token = WalletdAuth.token;
+      if (token == null || token.isEmpty) {
+        throw StateError('empty auth token');
+      }
+      await File(authTokenFile).writeAsString(token, flush: true);
+      if (!Platform.isWindows) {
+        final chmod = await Process.run('chmod', ['600', authTokenFile]);
+        if (chmod.exitCode != 0) {
+          throw StateError('chmod 600 on the auth token file failed');
+        }
+        final mode = await FileStat.stat(authTokenFile).then((st) => st.mode);
+        if ((mode & 0x1FF) != 0x180) {
+          throw StateError('auth token file is not owner-only after chmod');
+        }
+      }
+      args.addAll(['--auth-token-file', authTokenFile]);
+    } catch (e) {
+      debugPrint(
+        '[daemon] walletd auth token unavailable; API will be unauthenticated: $e',
+      );
+    }
+
+    try {
+      debugPrint('[daemon] Starting fuego_walletd: $binary ${args.join(' ')}');
+      _walletd = await Process.start(binary, args);
+      if (kDebugMode) {
+        _walletd!.stdout
+            .transform<String>(utf8.decoder)
+            .listen((l) => debugPrint('[walletd:out] $l'));
+        _walletd!.stderr
+            .transform<String>(utf8.decoder)
+            .listen((l) => debugPrint('[walletd:err] $l'));
+      } else {
+        _walletd!.stdout.drain<void>();
+        _walletd!.stderr.drain<void>();
+      }
+      _walletd!.exitCode.then((code) {
+        debugPrint('[daemon] fuego_walletd exited with code $code');
+        _walletd = null;
+        daemonErrors['walletd'] = 'exited with code $code';
+      });
+    } catch (e) {
+      return 'Failed to spawn: $e';
+    }
+
+    // Local --local can take a long time (download/start fuegod + sync).
+    // Remote proxy is usually up within a few seconds.
+    final maxAttempts = useLocalNode ? 90 : 45;
+    for (var i = 0; i < maxAttempts; i++) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+
+      // Process died early
+      if (_walletd == null) {
+        return daemonErrors['walletd'] ?? 'fuego_walletd exited during startup';
+      }
+
+      if (await _checkHealth(
+        'http://127.0.0.1:$walletdPort/health',
+        timeout: const Duration(seconds: 2),
+      )) {
+        debugPrint(
+          '[daemon] fuego_walletd ready on port $walletdPort (health)',
+        );
+        return null;
+      }
+
+      // Some builds only answer on /json_rpc
+      if (await _probeJsonRpcReady(walletdPort)) {
+        debugPrint(
+          '[daemon] fuego_walletd ready on port $walletdPort (json_rpc)',
+        );
+        return null;
+      }
+
+      if (i % 10 == 0) {
+        debugPrint(
+          '[daemon] waiting for fuego_walletd… attempt ${i + 1}/$maxAttempts',
+        );
+      }
+    }
+    return 'fuego_walletd not ready after ${maxAttempts * 2}s';
+  }
+
+  /// True when a walletd on [port] reports a healthy embedded fuegod
+  /// (`daemon:true` / `fuego:true` in GET /health). False when the health
+  /// body is missing the keys or reports the embedded chain offline —
+  /// used to detect stale walletd processes in local mode.
+  Future<bool> _walletdEmbeddedFuegodOk(int port) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    try {
+      final req = await client.getUrl(
+        Uri.parse('http://127.0.0.1:$port/health'),
+      );
+      final resp = await req.close().timeout(const Duration(seconds: 2));
+      final body = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode != 200) return false;
+      final data = jsonDecode(body);
+      if (data is Map<String, dynamic>) {
+        final daemon = data['daemon'];
+        if (daemon is bool) return daemon;
+        final fuego = data['fuego'];
+        if (fuego is bool) return fuego;
+      }
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// True when the walletd on [port] implements wallet_status (and so
+  /// open_wallet/close_wallet).
+  Future<bool> _walletdHasWalletSlot(int port) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    try {
+      final req = await client.postUrl(
+        Uri.parse('http://127.0.0.1:$port/json_rpc'),
+      );
+      req.headers.contentType = ContentType.json;
+      // Without the token these probes get 401 from a walletd we started
+      // ourselves, the app then judges its own healthy daemon "stale" and kills
+      // it on every relaunch.
+      final probeToken = WalletdAuth.token;
+      if (probeToken != null && probeToken.isNotEmpty) {
+        req.headers.set('Authorization', 'Bearer $probeToken');
+      }
+      req.write(
+        jsonEncode({
+          'jsonrpc': '2.0',
+          'id': 1,
+          'method': 'wallet_status',
+          'params': <String, dynamic>{},
+        }),
+      );
+      final resp = await req.close().timeout(const Duration(seconds: 2));
+      final body = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode != 200) return false;
+      final data = jsonDecode(body);
+      return data is Map<String, dynamic> && data['result'] is Map;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<bool> _probeJsonRpcReady(int port) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+    try {
+      final req = await client.postUrl(
+        Uri.parse('http://127.0.0.1:$port/json_rpc'),
+      );
+      req.headers.contentType = ContentType.json;
+      // Without the token these probes get 401 from a walletd we started
+      // ourselves, the app then judges its own healthy daemon "stale" and kills
+      // it on every relaunch.
+      final probeToken = WalletdAuth.token;
+      if (probeToken != null && probeToken.isNotEmpty) {
+        req.headers.set('Authorization', 'Bearer $probeToken');
+      }
+      req.write(
+        jsonEncode({
+          'jsonrpc': '2.0',
+          'id': 1,
+          'method': 'getinfo',
+          'params': <String, dynamic>{},
+        }),
+      );
+      final resp = await req.close().timeout(const Duration(seconds: 2));
+      await resp.drain<void>();
+      return resp.statusCode == 200;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<String?> _startUnifyd(
+    String binary, {
+    bool useLocalNode = true,
+    bool useTestnet = false,
+    String daemonHost = '127.0.0.1',
+    int daemonPort = 18180,
+  }) async {
+    debugPrint('[daemon] _startUnifyd: binary=$binary');
+
+    // Load before the readiness probes below: they call the wallet JSON-RPC,
+    // which rejects an unauthenticated caller, and a probe that 401s makes the
+    // app treat a healthy daemon as stale and kill it.
+    await WalletdAuth.load();
+
+    // Detect externally-started unifyd daemon
+    final alreadyRunning =
+        await _probeJsonRpcReady(walletdPort) ||
+        await _checkHealth(
+          'http://127.0.0.1:$walletdPort/health',
+          timeout: const Duration(seconds: 2),
+        );
+    if (alreadyRunning) {
+      _walletdExternallyRunning = true;
+      _fuegodExternallyRunning = true;
+      debugPrint('[daemon] Unifyd daemon already running on port $walletdPort');
+      return null;
+    }
+
+    // Kill stale processes on ports the unifyd daemon binds: wallet proxy
+    // (18189), embedded fuegod RPC (18180), and P2P (10808). Leftover
+    // daemons from a previous app instance (e.g. a translocated copy of the
+    // app) hold these and make the new instance die with "Address already
+    // in use" → exit code 1.
+    for (final port in [walletdPort, daemonPort, 10808]) {
+      final portErr = await _freePort(port);
+      if (portErr != null) {
+        debugPrint('[daemon] Port $port error: $portErr');
+        return portErr;
+      }
+    }
+
+    // Unifyd daemon needs --container-file and --container-password (via file, not argv)
+    final security = SecurityService();
+    final appDir = await getApplicationSupportDirectory();
+    final walletDir = p.join(appDir.path, 'wallet');
+    await Directory(walletDir).create(recursive: true);
+    final containerFile = p.join(walletDir, 'fuego_wallet');
+    String? containerPassword;
+    String? pwFile;
+    try {
+      containerPassword = await security.getOrCreateWalletdPassword();
+      debugPrint('[daemon] Got wallet password from Keychain');
+    } catch (e) {
+      debugPrint(
+        '[daemon] Keychain unavailable, starting without container password',
+      );
+    }
+    // Write password to 0600 file if available — avoids argv leak (CWE-214)
+    if (containerPassword != null) {
+      try {
+        pwFile = p.join(walletDir, '.container_pw');
+        await File(pwFile).writeAsString(containerPassword, flush: true);
+        if (!Platform.isWindows) await Process.run('chmod', ['600', pwFile]);
+      } catch (_) {
+        pwFile = null;
+      }
+    }
+
+    // Generate container if it doesn't exist yet
+    final containerExists = await File(containerFile).exists();
+    if (!containerExists) {
+      debugPrint(
+        '[daemon] Container not found at $containerFile — generating...',
+      );
+      final genArgs = <String>[
+        '--generate-container',
+        '--container-file',
+        containerFile,
+      ];
+      if (pwFile != null) {
+        genArgs.addAll(['--container-password-file', pwFile]);
+      } else if (containerPassword != null) {
+        // Fallback only if file write failed and Rust supports env; avoid argv if possible
+        genArgs.addAll(['--container-password', containerPassword]);
+      }
+      if (useTestnet) genArgs.add('--testnet');
+      debugPrint('[daemon] unifyd generate-container (password redacted)');
+      final genEnv = containerPassword != null
+          ? {'WALLETD_CONTAINER_PASSWORD': containerPassword}
+          : null;
+      final genProc = await Process.run(binary, genArgs, environment: genEnv);
+      debugPrint('[daemon] generate-container exit code: ${genProc.exitCode}');
+      if (genProc.exitCode != 0) {
+        final err = genProc.stderr.toString().trim();
+        debugPrint('[daemon] generate-container stderr: $err');
+        return 'Failed to generate wallet container: $err';
+      }
+      debugPrint('[daemon] Wallet container generated at $containerFile');
+    }
+
+    final args = <String>[
+      '--bind-port',
+      walletdPort.toString(),
+      '--container-file',
+      containerFile,
+    ];
+    try {
+      final authTokenFile = await WalletdAuth.tokenFilePath();
+      final token = WalletdAuth.token;
+      if (token == null || token.isEmpty) {
+        throw StateError('empty auth token');
+      }
+      await File(authTokenFile).writeAsString(token, flush: true);
+      if (!Platform.isWindows) {
+        final chmod = await Process.run('chmod', ['600', authTokenFile]);
+        if (chmod.exitCode != 0) {
+          throw StateError('chmod 600 on the auth token file failed');
+        }
+        final mode = await FileStat.stat(authTokenFile).then((st) => st.mode);
+        if ((mode & 0x1FF) != 0x180) {
+          throw StateError('auth token file is not owner-only after chmod');
+        }
+      }
+      args.addAll(['--auth-token-file', authTokenFile]);
+    } catch (e) {
+      debugPrint(
+        '[daemon] unifyd auth token unavailable; API will be unauthenticated: $e',
+      );
+    }
+    if (pwFile != null) {
+      args.addAll(['--container-password-file', pwFile]);
+    } else if (containerPassword != null) {
+      args.addAll(['--container-password', containerPassword]);
+    }
+    if (useLocalNode) {
+      args.add('--local');
+    } else {
+      args.addAll([
+        '--daemon-host',
+        daemonHost,
+        '--daemon-port',
+        daemonPort.toString(),
+      ]);
+    }
+    if (useTestnet) args.add('--testnet');
+
+    debugPrint('[daemon] unifyd starting (password redacted)');
+
+    try {
+      debugPrint('[daemon] Spawning unifyd daemon...');
+      final env = containerPassword != null
+          ? {
+              'WALLETD_CONTAINER_PASSWORD': containerPassword,
+              ...Platform.environment,
+            }
+          : null;
+      _unifyd = await Process.start(binary, args, environment: env);
+      debugPrint('[daemon] unifyd process started (PID ${_unifyd!.pid})');
+      if (kDebugMode) {
+        _unifyd!.stdout
+            .transform<String>(utf8.decoder)
+            .listen((l) => debugPrint('[unifyd:out] $l'));
+        _unifyd!.stderr
+            .transform<String>(utf8.decoder)
+            .listen((l) => debugPrint('[unifyd:err] $l'));
+      } else {
+        // Keep a bounded buffer so startup failures surface the real
+        // cause (e.g. "Address already in use") instead of just exit code 1.
+        final buffer = StringBuffer();
+        _unifyd!.stdout.transform<String>(utf8.decoder).listen((l) {
+          if (buffer.length < 8192) buffer.write(l);
+        });
+        _unifyd!.stderr.transform<String>(utf8.decoder).listen((l) {
+          if (buffer.length < 8192) buffer.write(l);
+        });
+        _unifiedExitLog = buffer;
+      }
+      _unifyd!.exitCode.then((code) {
+        debugPrint('[daemon] unifyd daemon exited with code $code');
+        final logTail = _unifiedExitLog?.toString().trim();
+        daemonErrors['unifyd'] = logTail != null && logTail.isNotEmpty
+            ? 'exited with code $code — $logTail'
+            : 'exited with code $code';
+        _unifyd = null;
+        _updateStatus();
+      });
+    } catch (e) {
+      return 'Failed to spawn: $e';
+    }
+
+    // Wait for ready — unifyd daemon exposes /json_rpc with getHealth
+    // Blockchain rescan + wallet scan can take up to ~150s on mainnet
+    debugPrint('[daemon] Waiting for unifyd daemon on port $walletdPort...');
+    for (var i = 0; i < 90; i++) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+
+      // Process died — don't keep polling a corpse for 180s.
+      if (_unifyd == null) {
+        debugPrint('[daemon] unifyd daemon exited during startup');
+        return daemonErrors['unifyd'] ?? 'unifyd daemon exited during startup';
+      }
+
+      HttpClient? client;
+      try {
+        client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+        final req = await client.getUrl(
+          Uri.parse('http://127.0.0.1:$walletdPort/health'),
+        );
+        final resp = await req.close().timeout(const Duration(seconds: 2));
+        await resp.drain<void>();
+        if (resp.statusCode == 200) {
+          debugPrint(
+            '[daemon] unifyd daemon healthy on port $walletdPort (attempt ${i + 1})',
+          );
+          return null;
+        } else {
+          debugPrint(
+            '[daemon] health check attempt ${i + 1}: HTTP ${resp.statusCode}',
+          );
+        }
+      } catch (e) {
+        if (i % 10 == 0) {
+          debugPrint('[daemon] health check attempt ${i + 1}: $e');
+        }
+      } finally {
+        client?.close(force: true);
+      }
+    }
+    debugPrint('[daemon] unifyd daemon not ready after 180s');
+    return 'unifyd daemon not ready after 180s';
+  }
+
+  Future<String?> _startSwapd({
+    String? configPath,
+    String chainHost = '127.0.0.1',
+    int chainPort = 18180,
+    int walletPort = 18189,
+    bool useTestnet = false,
+  }) async {
+    // Detect externally-started swapd
+    final alreadyRunning =
+        await _probeJsonRpcReady(swapdPort) ||
+        await _checkHealth(
+          'http://127.0.0.1:$swapdPort/health',
+          timeout: const Duration(seconds: 2),
+        );
+    if (alreadyRunning) {
+      _swapdExternallyRunning = true;
+      debugPrint('[daemon] xfg-swapd already running on port $swapdPort');
+      return null;
+    }
+
+    final binary = _findSwapdBinary();
+    if (binary == null) return 'xfg-swapd binary not found';
+
+    final portErr = await _freePort(swapdPort);
+    if (portErr != null) return portErr;
+
+    final List<String> args;
+    final goHeadless = _isGoSwapd(binary);
+    if (goHeadless) {
+      // Go swapxfg headless control API (--headless-port, default probe 18902)
+      args = [
+        '--headless',
+        '--headless-port',
+        swapdPort.toString(),
+        '--daemon',
+        'http://$chainHost:$chainPort',
+        '--wallet',
+        'http://127.0.0.1:$walletPort',
+        '--no-bridge',
+        '--no-bch',
+      ];
+      // Do not pass bare --testnet: it overrides --daemon/--wallet to hard-coded ports.
+    } else if (configPath != null && File(configPath).existsSync()) {
+      _lastSwapdConfigPath = configPath;
+      args = ['--swap-config', configPath, '--service'];
+    } else {
+      return 'xfg-swapd needs Go headless binary (fuego-suite/swapxfg/xfg-swapd) '
+          'or a C++ --swap-config file';
+    }
+
+    try {
+      debugPrint('[daemon] Starting xfg-swapd: $binary ${args.join(' ')}');
+      _swapd = await Process.start(binary, args);
+      if (kDebugMode) {
+        _swapd!.stdout
+            .transform<String>(utf8.decoder)
+            .listen((l) => debugPrint('[swapd:out] $l'));
+        _swapd!.stderr
+            .transform<String>(utf8.decoder)
+            .listen((l) => debugPrint('[swapd:err] $l'));
+      } else {
+        _swapd!.stdout.drain<void>();
+        _swapd!.stderr.drain<void>();
+      }
+      _swapd!.exitCode.then((code) {
+        debugPrint('[daemon] xfg-swapd exited with code $code');
+        _swapd = null;
+        // Crash-only auto-restart: the swap daemon occasionally dies when a
+        // dependency (wallet proxy) bounces mid-handshake. Intentional stops
+        // set [_stopping] and never respawn here.
+        if (!_stopping && code != 0) {
+          Future<void>.delayed(const Duration(seconds: 3), () async {
+            if (_stopping || _swapd != null || !anyRunning) return;
+            debugPrint('[daemon] restarting xfg-swapd after crash');
+            final binary = _findSwapdBinary();
+            if (binary == null) return;
+            try {
+              final goHeadless = _isGoSwapd(binary);
+              final cfg = _lastSwapdConfigPath;
+              final args = goHeadless
+                  ? [
+                      '--headless',
+                      '--headless-port',
+                      swapdPort.toString(),
+                      '--daemon',
+                      'http://127.0.0.1:$fuegodPort',
+                      '--wallet',
+                      'http://127.0.0.1:$walletdPort',
+                      '--no-bridge',
+                      '--no-bch',
+                    ]
+                  : (cfg != null && File(cfg).existsSync()
+                        ? ['--swap-config', cfg, '--service']
+                        : <String>['--service']);
+              _swapd = await Process.start(binary, args);
+              _swapd!.stdout.drain<void>();
+              _swapd!.stderr.drain<void>();
+              _swapd!.exitCode.then((c) {
+                debugPrint('[daemon] xfg-swapd exited with code $c');
+                _swapd = null;
+              });
+            } catch (e) {
+              debugPrint('[daemon] xfg-swapd restart failed: $e');
+            }
+          });
+        }
+      });
+    } catch (e) {
+      return 'Failed to spawn: $e';
+    }
+
+    for (var i = 0; i < 20; i++) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+      if (_swapd == null) {
+        return daemonErrors['swapd'] ?? 'xfg-swapd exited during startup';
+      }
+      // Prefer /health; Go headless also serves /status
+      if (await _checkHealth(
+            'http://127.0.0.1:$swapdPort/health',
+            timeout: const Duration(seconds: 2),
+          ) ||
+          await _checkHealth(
+            'http://127.0.0.1:$swapdPort/status',
+            timeout: const Duration(seconds: 2),
+          )) {
+        debugPrint('[daemon] xfg-swapd ready on port $swapdPort');
+        return null;
+      }
+    }
+    return 'xfg-swapd not ready after 20s';
+  }
+
+  // ── Stop all daemons ─────────────────────────────────────────────
+
+  Future<void> stopAll() async {
+    _stopping = true;
+    eventBus.stop();
+    await _stopProcess(_unifyd, 'unifyd');
+    _unifyd = null;
+    await _stopProcess(_swapd, 'xfg-swapd');
+    _swapd = null;
+    await _stopProcess(_walletd, 'fuego_walletd');
+    _walletd = null;
+    await _stopProcess(_fuegod, 'fuegod');
+    _fuegod = null;
+    _walletdExternallyRunning = false;
+    _fuegodExternallyRunning = false;
+    _swapdExternallyRunning = false;
+    _stopping = false;
+    _updateStatus();
+  }
+
+  Future<void> stopSwapd() async {
+    _stopping = true;
+    await _stopProcess(_swapd, 'xfg-swapd');
+    _swapd = null;
+    _stopping = false;
+    _updateStatus();
+  }
+
+  Future<void> _stopProcess(Process? process, String name) async {
+    if (process == null) return;
+    try {
+      process.kill(ProcessSignal.sigterm);
+      await process.exitCode.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          process.kill(ProcessSignal.sigkill);
+          return -1;
+        },
+      );
+    } catch (_) {}
+    debugPrint('[daemon] $name stopped');
+  }
+
+  // ── Convenience getters ──────────────────────────────────────────
+
+  bool get unifiedRunning => _unifyd != null;
+  bool get fuegodRunning =>
+      _unifyd != null ||
+      _fuegod != null ||
+      (_walletd != null && status.value.fuegodRunning) ||
+      _fuegodExternallyRunning;
+
+  /// True when the local wallet proxy process handle is alive.
+  bool get walletdRunning =>
+      _unifyd != null || _walletd != null || _walletdExternallyRunning;
+  bool get swapdRunning =>
+      _unifyd != null || _swapd != null || _swapdExternallyRunning;
+
+  bool get allRunning => walletdRunning;
+  bool get anyRunning =>
+      _unifyd != null ||
+      _walletd != null ||
+      _fuegod != null ||
+      _swapd != null ||
+      _walletdExternallyRunning ||
+      _fuegodExternallyRunning ||
+      _swapdExternallyRunning;
+
+  void dispose() {
+    status.dispose();
+    eventBus.stop();
+  }
+}
+
+/// Snapshot of daemon health status.
+class DaemonStatus {
+  final bool fuegodRunning;
+  final bool walletdRunning;
+  final bool swapdRunning;
+  final String? fuegodError;
+  final String? walletdError;
+  final String? swapdError;
+
+  const DaemonStatus({
+    this.fuegodRunning = false,
+    this.walletdRunning = false,
+    this.swapdRunning = false,
+    this.fuegodError,
+    this.walletdError,
+    this.swapdError,
+  });
+
+  bool get hasErrors =>
+      fuegodError != null || walletdError != null || swapdError != null;
+  bool get allHealthy => fuegodRunning && walletdRunning && swapdRunning;
+
+  /// Human-readable status summary for UI display.
+  String get displayText {
+    final parts = <String>[];
+    if (!fuegodRunning) parts.add('Node: ${fuegodError ?? "offline"}');
+    if (!walletdRunning) parts.add('Wallet: ${walletdError ?? "offline"}');
+    if (!swapdRunning) parts.add('Swap: ${swapdError ?? "offline"}');
+    return parts.join(' \u2022 ');
+  }
+
+  String? get summary {
+    final running = [
+      if (fuegodRunning) 'fuegod',
+      if (walletdRunning) 'walletd',
+      if (swapdRunning) 'swapd',
+    ];
+    final stopped = [
+      if (!fuegodRunning) 'fuegod',
+      if (!walletdRunning) 'walletd',
+      if (!swapdRunning) 'swapd',
+    ];
+    if (running.isEmpty) return 'All daemons stopped';
+    if (stopped.isEmpty) return 'All daemons running';
+    return '${running.join(", ")} running, ${stopped.join(", ")} stopped';
+  }
+}
+
+class _HealthResult {
+  final bool ok;
+  final String? error;
+  _HealthResult.ok() : ok = true, error = null;
+  _HealthResult.error(this.error) : ok = false;
+}

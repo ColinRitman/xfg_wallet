@@ -1,0 +1,436 @@
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+
+import 'constants.dart';
+import 'network_info.dart';
+import '../services/walletd_auth.dart';
+import 'transaction.dart';
+
+class FuegoDaemonClient {
+  String host;
+  int port;
+
+  /// Local fuego_walletd port; follows mainnet/testnet switches (see main.dart).
+  int walletPort;
+  final http.Client _http;
+
+  FuegoDaemonClient({
+    this.host = '127.0.0.1',
+    this.port = defaultRpcPort,
+    this.walletPort = 18189,
+    http.Client? client,
+  }) : _http = client ?? http.Client();
+
+  /// Update chain endpoint after connection resolution.
+  void updateNode(String newHost, {int? newPort}) {
+    host = newHost;
+    if (newPort != null) port = newPort;
+  }
+
+  /// True when [host] is a loopback address suitable for key-bearing APIs.
+  static bool isLocalHost(String host) {
+    final h = host.trim().toLowerCase();
+    return h == '127.0.0.1' || h == 'localhost' || h == '::1' || h == '0.0.0.0';
+  }
+
+  Uri _rest(String path, {bool useWallet = false}) => Uri(
+    scheme: 'http',
+    host: useWallet ? '127.0.0.1' : host,
+    port: useWallet ? walletPort : port,
+    path: path,
+  );
+
+  void _log(String message) {
+    if (kDebugMode) {
+      debugPrint(message);
+    }
+  }
+
+  Future<Map<String, dynamic>> _get(
+    String path, {
+    Map<String, String>? query,
+    bool useWallet = false,
+  }) async {
+    final uri = _rest(
+      path,
+      useWallet: useWallet,
+    ).replace(queryParameters: query);
+    _log('[daemon] GET $uri');
+    // The token authorises the local wallet API; it must not be sent to a
+    // remote seed node, which is what `host` resolves to in remote mode.
+    final resp = await _http
+        .get(uri, headers: WalletdAuth.headersForHost(uri.host))
+        .timeout(const Duration(seconds: 10));
+    if (resp.statusCode != 200) {
+      throw FuegoRpcException('HTTP ${resp.statusCode}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> _post(
+    String path,
+    Map<String, dynamic> body, {
+    bool useWallet = false,
+  }) async {
+    final uri = _rest(path, useWallet: useWallet);
+    _log('[daemon] POST $uri');
+    final resp = await _http
+        .post(
+          uri,
+          headers: {
+            'Content-Type': 'application/json',
+            ...WalletdAuth.headersForHost(uri.host),
+          },
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 10));
+    if (resp.statusCode != 200) {
+      throw FuegoRpcException('HTTP ${resp.statusCode}');
+    }
+    final data = jsonDecode(resp.body) as Map<String, dynamic>;
+    if (data.containsKey('error') && data['error'] != null) {
+      throw FuegoRpcException(data['error'].toString());
+    }
+    return data;
+  }
+
+  // ── Network info ──
+
+  Future<NetworkInfo> getInfo() async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'getinfo',
+      'params': {},
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    return NetworkInfo.fromJson(result);
+  }
+
+  Future<int> getPeerCount() async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'getinfo',
+      'params': {},
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    final outgoing = result['outgoing_connections_count'] as int? ?? 0;
+    final incoming = result['incoming_connections_count'] as int? ?? 0;
+    return outgoing + incoming;
+  }
+
+  Future<int> getWalletHeight() async {
+    try {
+      final r = await _post('/json_rpc', {
+        'jsonrpc': '2.0',
+        'id': 'fuego_core',
+        'method': 'getStatus',
+        'params': {},
+      }, useWallet: true);
+      final result = r['result'] as Map<String, dynamic>? ?? r;
+      return (result['height'] as int?) ??
+          (result['scanned_height'] as int?) ??
+          (result['current_height'] as int?) ??
+          0;
+    } catch (_) {
+      final health = await _get('/health', useWallet: true);
+      final wallet = health['wallet'] as Map<String, dynamic>?;
+      return (health['scanned_height'] as int?) ??
+          (wallet?['height'] as int?) ??
+          0;
+    }
+  }
+
+  // ── Wallet operations (local walletd / backend only) ──
+
+  Future<String> getWalletAddress() async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'getAddress',
+      'params': {},
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    return (result['address'] as String?) ?? '';
+  }
+
+  Future<Map<String, dynamic>> _walletRpc(
+    String method, [
+    Map<String, dynamic> params = const {},
+  ]) async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': method,
+      'params': params,
+    }, useWallet: true);
+    return r['result'] as Map<String, dynamic>? ?? const {};
+  }
+
+  // ── Which wallet walletd serves ──
+  // walletd starts with no wallet (--await-wallet); the app hands it the vault
+  // seed after unlock and takes it back on lock. Always loopback (useWallet).
+
+  /// Opens the vault wallet in walletd. [seedHex] is the 32-byte vault seed.
+  /// Returns walletd's primary address for it.
+  Future<String> openWallet(String seedHex) async {
+    final r = await _walletRpc('open_wallet', {'seed': seedHex});
+    return r['address'] as String? ?? '';
+  }
+
+  /// Stops walletd using the vault keys (vault locked).
+  Future<void> closeWallet() => _walletRpc('close_wallet');
+
+  /// The wallet an older walletd generated for itself (master_seed.bin), when
+  /// present: address and balance. Null when there is none.
+  Future<Map<String, dynamic>?> getLegacyWallet() async {
+    final r = await _walletRpc('get_legacy_wallet');
+    return r.isEmpty ? null : r;
+  }
+
+  /// Moves that wallet's confirmed funds to the open vault wallet, up to 50
+  /// outputs per call. Returns the tx hash (null: nothing to move) and how many
+  /// outputs remain for another call.
+  Future<(String?, int)> sweepLegacyWallet() async {
+    final r = await _walletRpc('sweep_legacy_wallet');
+    return (r['txHash'] as String?, r['remaining'] as int? ?? 0);
+  }
+
+  // ── Sub-addresses (fuego-suite scheme, derived and scanned by walletd) ──
+
+  /// Hands out the next sub-address. Returns (index, address).
+  Future<(int, String)> createSubaddress() async {
+    final r = await _walletRpc('create_subaddress');
+    final index = r['index'] as int?;
+    final address = r['address'] as String?;
+    if (index == null || address == null || address.isEmpty) {
+      throw FuegoRpcException('create_subaddress: malformed response');
+    }
+    return (index, address);
+  }
+
+  /// Sub-addresses with unspent balances, and legacy sub-addresses with the
+  /// balance still to be swept.
+  Future<Map<String, dynamic>> getSubaddresses() =>
+      _walletRpc('get_subaddresses');
+
+  /// Starts scanning old-scheme sub-addresses; walletd rescans once when the set grows.
+  Future<bool> registerLegacySubaddresses(List<int> indices) async {
+    final r = await _walletRpc('register_legacy_subaddresses', {
+      'indices': indices,
+    });
+    return r['rescan'] as bool? ?? false;
+  }
+
+  /// Moves confirmed legacy sub-address funds to the primary address.
+  /// Returns the transaction hash, or null when there was nothing to move.
+  Future<String?> sweepLegacySubaddresses() async {
+    final r = await _walletRpc('sweep_legacy_subaddresses');
+    return r['txHash'] as String?;
+  }
+
+  Future<String> getAddress() async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'getAddresses',
+      'params': {},
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    final addresses = result['addresses'] as List<dynamic>? ?? [];
+    return addresses.isNotEmpty ? addresses.first as String : '';
+  }
+
+  Future<int> getBalance() async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'getBalance',
+      'params': {},
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    return (result['availableBalance'] ?? result['balance'] ?? 0) as int;
+  }
+
+  Future<({int available, int locked})> getBalanceDetailed() async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'getBalance',
+      'params': {},
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    final available =
+        (result['availableBalance'] ??
+                result['available_balance'] ??
+                result['balance'] ??
+                0)
+            as int;
+    final locked =
+        (result['lockedAmount'] ?? result['locked_amount'] ?? 0) as int;
+    return (available: available, locked: locked);
+  }
+
+  Future<String> sendTransaction(SendTransactionRequest req) async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'sendTransaction',
+      'params': {
+        'destinations': [
+          {'amount': (req.amount * 1e7).toInt(), 'address': req.address},
+        ],
+        'fee': (req.fee * 1e7).toInt(),
+        'anonymity': req.mixin,
+        if (req.paymentId != null) 'paymentId': req.paymentId,
+      },
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    final hash = result['transactionHash'] as String? ?? '';
+    if (hash.isEmpty) {
+      throw FuegoRpcException('Empty transaction hash from daemon');
+    }
+    return hash;
+  }
+
+  Future<List<FuegoTransaction>> getTransactions({int count = 20}) async {
+    final r = await _post('/json_rpc', {
+      'jsonrpc': '2.0',
+      'id': 'fuego_core',
+      'method': 'getTransactions',
+      'params': {'blockCount': count, 'firstBlockIndex': 0},
+    }, useWallet: true);
+    final result = r['result'] as Map<String, dynamic>? ?? r;
+    final items = result['items'] as List<dynamic>? ?? [];
+    final txs = <FuegoTransaction>[];
+    for (final item in items) {
+      final txList = item['transactions'] as List<dynamic>? ?? [];
+      for (final t in txList) {
+        final map = Map<String, dynamic>.from(t as Map);
+        final amountVal = map['amount'];
+        final amountNum = amountVal is num ? amountVal.toInt() : 0;
+        map['direction'] = amountNum < 0 ? 'out' : 'in';
+        txs.add(FuegoTransaction.fromJson(map));
+      }
+    }
+    txs.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    return txs.take(count).toList();
+  }
+
+  // ── Mining ──
+
+  Future<void> startMining({int threads = 1, String? address}) async {
+    try {
+      await _post('/json_rpc', {
+        'jsonrpc': '2.0',
+        'id': 'fuego_core',
+        'method': 'start_mining',
+        'params': {
+          'threads_count': threads,
+          if (address != null) 'miner_address': address,
+        },
+      });
+    } catch (_) {}
+  }
+
+  Future<void> stopMining() async {
+    try {
+      await _post('/json_rpc', {
+        'jsonrpc': '2.0',
+        'id': 'fuego_core',
+        'method': 'stop_mining',
+        'params': {},
+      });
+    } catch (_) {}
+  }
+
+  Future<Map<String, dynamic>> getMiningStatus() async {
+    try {
+      final r = await _post('/json_rpc', {
+        'jsonrpc': '2.0',
+        'id': 'fuego_core',
+        'method': 'getinfo',
+        'params': {},
+      }, useWallet: true);
+      final result = r['result'] as Map<String, dynamic>? ?? r;
+      return {
+        'active': (result['mining_speed'] ?? 0) > 0,
+        'speed': result['mining_speed'] ?? 0,
+        'hashrate': result['mining_speed'] ?? 0,
+        'threads': result['threads_count'] ?? 0,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<Map<String, dynamic>> getStatus() async {
+    return await _get('/status');
+  }
+
+  /// Fetch raw ΗΞΔŦ metrics (supply, TWAP redemption price, treasury, CD
+  /// yield) from the daemon's `/heat_metrics` endpoint.
+  Future<Map<String, dynamic>> getHeatMetricsRaw() async {
+    return await _get('/heat_metrics');
+  }
+
+  /// Scan blockchain for outputs belonging to our keys.
+  ///
+  /// **Security:** always targets the local backend (`127.0.0.1:walletPort`).
+  /// Never sends view secrets to remote seed nodes.
+  Future<Map<String, dynamic>> scanBalance({
+    required String viewSecret,
+    required String spendPublic,
+    int startHeight = 0,
+    int batchSize = 100,
+  }) async {
+    if (viewSecret.isEmpty || spendPublic.isEmpty) {
+      throw FuegoRpcException('Missing keys for scan_balance');
+    }
+    // Force loopback — ignore configured remote host for key-bearing calls
+    final uri = Uri(
+      scheme: 'http',
+      host: '127.0.0.1',
+      port: walletPort,
+      path: '/scan_balance',
+    );
+    _log('[daemon] POST $uri (scan_balance, local-only)');
+    final resp = await _http
+        .post(
+          uri,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'view_secret': viewSecret,
+            'spend_public': spendPublic,
+            'start_height': startHeight,
+            'batch_size': batchSize,
+          }),
+        )
+        .timeout(const Duration(seconds: 60));
+    if (resp.statusCode == 409) {
+      // No wallet open, or walletd serves a wallet other than these keys'.
+      throw const WalletdWalletMismatch();
+    }
+    if (resp.statusCode != 200) {
+      throw FuegoRpcException('scan_balance HTTP ${resp.statusCode}');
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  void dispose() => _http.close();
+}
+
+class FuegoRpcException implements Exception {
+  final String message;
+  const FuegoRpcException(this.message);
+  @override
+  String toString() => 'FuegoRpcException: $message';
+}
+
+/// walletd has no wallet open, or has one other than the keys the call was for.
+class WalletdWalletMismatch extends FuegoRpcException {
+  const WalletdWalletMismatch() : super('walletd is not serving this wallet');
+}

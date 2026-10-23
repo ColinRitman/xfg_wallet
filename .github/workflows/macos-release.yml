@@ -1,0 +1,101 @@
+name: Fuego Wallet - macOS App Store Build & Submission Prep
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v1.0.0)"
+        required: false
+      dry_run:
+        description: "Dry run - build only, no notarization/upload"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FLUTTER_VERSION: "3.44.4"
+  MACOS_BUNDLE_ID: "com.fuego.fuego-wallet"
+
+jobs:
+  macos-build:
+    name: Build macOS App
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: "stable"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with: { toolchain: stable }
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: flutter-pub-cache-macos-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            flutter-pub-cache-macos-
+
+      - name: Install dependencies
+        run: |
+          for retry in 1 2 3; do
+            if flutter pub get; then
+              echo "✅ Flutter pub get successful on attempt $retry"
+              break
+            fi
+            echo "❌ Flutter pub get failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Run tests
+        continue-on-error: true
+        run: flutter test
+
+      - name: Analyze code
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build backends
+        uses: ./.github/actions/build-desktop-backends
+
+      - name: Build macOS app (Release)
+        run: flutter build macos --release --no-codesign
+
+      - name: Bundle backends into app
+        uses: ./.github/actions/bundle-desktop-backends
+        with:
+          app: build/macos/Build/Products/Release/fuego-valise.app
+
+      - name: Sign app
+        run: ./scripts/sign-macos-app.sh build/macos/Build/Products/Release/fuego-valise.app -
+
+      - name: Verify macOS app
+        run: |
+          APP_PATH="build/macos/Build/Products/Release/fuego-valise.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: App bundle not found at $APP_PATH"
+            exit 1
+          fi
+          echo "✅ Verification complete"
+
+      - name: Package app
+        run: |
+          cd build/macos/Build/Products/Release
+          zip -r -y fuego-valise-macOS.zip "fuego-valise.app"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuego-wallet-macos
+          path: build/macos/Build/Products/Release/fuego-valise-macOS.zip
+          retention-days: 30

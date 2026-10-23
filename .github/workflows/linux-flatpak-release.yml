@@ -1,0 +1,96 @@
+name: Fuego Wallet Linux Flatpak Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for this release (e.g. 1.0.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run — build but do not submit"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FLUTTER_VERSION: "3.44.4"
+  FLATPAK_APP_ID: "com.fuego.fuego_wallet"
+
+jobs:
+  build-flatpak:
+    name: Build Flatpak Bundle
+    # Oldest target glibc: snap core22 is Ubuntu 22.04; GNOME 46 runtime is newer.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: "stable"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git cmake libboost-all-dev libjsoncpp-dev \
+            libssl-dev libzmq3-dev clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libsecret-1-dev \
+            flatpak flatpak-builder
+
+      - name: Enable Linux desktop support
+        run: flutter config --enable-linux-desktop
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with: { toolchain: stable }
+
+      - name: Build backends
+        uses: ./.github/actions/build-desktop-backends
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze code
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build Linux desktop app
+        run: flutter build linux --release
+
+      - name: Bundle backends into app
+        uses: ./.github/actions/bundle-desktop-backends
+        with:
+          app: build/linux/x64/release/bundle
+
+      - name: Build Flatpak
+        run: |
+          flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --repo=repo --force-clean build-dir flatpak/${{ env.FLATPAK_APP_ID }}.yml
+
+      - name: Create Flatpak bundle
+        run: |
+          flatpak build-bundle repo xfg-wallet.flatpak ${{ env.FLATPAK_APP_ID }}
+
+      - name: Upload Flatpak bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-bundle
+          path: xfg-wallet.flatpak
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## Linux Flatpak Release" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Flatpak bundle built: \`xfg-wallet.flatpak\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "- Dry run — no submission" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Artifact uploaded to release" >> $GITHUB_STEP_SUMMARY
+          fi

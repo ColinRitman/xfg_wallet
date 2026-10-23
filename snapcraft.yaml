@@ -1,0 +1,40 @@
+name: xfg-wallet
+version: '1.0.0'
+summary: Privacy-focused cryptocurrency wallet for Fuego blockchain
+description: |
+  Fuego Wallet is a privacy-focused cryptocurrency wallet that supports
+  the Fuego blockchain and cross-chain atomic swaps.
+
+  Features:
+  - Send and receive Fuego (XFG) and HEAT
+  - Cross-chain atomic swaps with 12 blockchains
+  - Certificate of Deposit (CD) staking
+  - Built-in node connectivity
+  - Privacy-focused with RingCT transactions
+
+  No on-device mining is performed on any platform.
+  This is a FLOSS application with no proprietary dependencies.
+grade: stable
+confinement: strict
+base: core22
+icon: web/icons/Icon-512.png
+
+architectures:
+  - build-on: amd64
+
+apps:
+  xfg-wallet:
+    command: fuego-valise/fuego-valise
+    extensions: [gnome]
+    plugs:
+      - network
+      - network-bind
+      - home
+      - removable-media
+    environment:
+      LD_LIBRARY_PATH: $SNAP/usr/lib:$SNAP/usr/lib/x86_64-linux-gnu:$SNAP_APP/usr/lib
+
+parts:
+  fuego-valise:
+    plugin: dump
+    source: build/snap-root

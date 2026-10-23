@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:provider/provider.dart';
+import '../../bloc/wallet/wallet_cubit.dart';
 import '../../providers/wallet_provider.dart';
+import '../../services/fuego_vault_service.dart';
 import '../../services/security_service.dart';
 import '../../utils/theme.dart';
 import '../../widgets/pin_input_widget.dart';
 import '../main/main_screen.dart';
-import '../wallet_setup/setup_screen.dart';
 
 class PinEntryScreen extends StatefulWidget {
   const PinEntryScreen({super.key});
@@ -19,12 +21,12 @@ class _PinEntryScreenState extends State<PinEntryScreen>
   final SecurityService _securityService = SecurityService();
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
-  
+
   bool _isLoading = false;
   String? _errorMessage;
   bool _canUseBiometric = false;
   int _failedAttempts = 0;
-  static const int maxFailedAttempts = 69;
+  static const int maxFailedAttempts = SecurityService.maxFailedAttempts;
 
   @override
   void initState() {
@@ -40,13 +42,9 @@ class _PinEntryScreenState extends State<PinEntryScreen>
       vsync: this,
     );
 
-    _fadeAnimation = Tween<double>(
-      begin: 0.0,
-      end: 1.0,
-    ).animate(CurvedAnimation(
-      parent: _fadeController,
-      curve: Curves.easeInOut,
-    ));
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut),
+    );
 
     _fadeController.forward();
   }
@@ -54,7 +52,7 @@ class _PinEntryScreenState extends State<PinEntryScreen>
   Future<void> _checkBiometricCapability() async {
     final available = await _securityService.isBiometricAvailable();
     final enabled = await _securityService.isBiometricEnabled();
-    
+
     setState(() {
       _canUseBiometric = available && enabled;
     });
@@ -73,15 +71,38 @@ class _PinEntryScreenState extends State<PinEntryScreen>
 
   Future<void> _authenticateWithBiometric() async {
     try {
-      final authenticated = await _securityService.authenticateWithBiometrics(
-        reason: 'Authenticate to access your XF₲ wallet',
+      if (await _securityService.isLockedOut()) {
+        if (mounted) {
+          setState(() {
+            _errorMessage = 'Too many failed attempts. Try again later.';
+          });
+        }
+        return;
+      }
+      final walletProvider = Provider.of<WalletProvider>(
+        context,
+        listen: false,
       );
-
-      if (authenticated && mounted) {
-        await _unlockWallet('biometric');
+      setState(() {
+        _isLoading = true;
+        _errorMessage = null;
+      });
+      final success = await walletProvider.unlockWithBiometrics();
+      if (success && mounted) {
+        await _onUnlockedSuccess();
+      } else if (mounted) {
+        setState(() {
+          _errorMessage =
+              walletProvider.error ?? 'Biometric unlock failed — use PIN';
+          _isLoading = false;
+        });
       }
     } catch (e) {
-      // Biometric auth failed or cancelled, user can still use PIN
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
     }
   }
 
@@ -92,14 +113,24 @@ class _PinEntryScreenState extends State<PinEntryScreen>
     });
 
     try {
+      if (await _securityService.isLockedOut()) {
+        final rem = await _securityService.lockoutRemaining();
+        final mins = rem?.inMinutes ?? 15;
+        setState(() {
+          _errorMessage = 'Locked out. Try again in ~$mins min.';
+          _isLoading = false;
+        });
+        return;
+      }
+
       final isValid = await _securityService.verifyPIN(pin);
-      
       if (isValid) {
         await _unlockWallet(pin);
       } else {
-        _handleFailedAttempt();
+        await _handleFailedAttempt();
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Authentication failed. Please try again.';
         _isLoading = false;
@@ -107,41 +138,56 @@ class _PinEntryScreenState extends State<PinEntryScreen>
     }
   }
 
-  Future<void> _unlockWallet(String credentials) async {
+  Future<void> _unlockWallet(String pin) async {
     try {
-      final walletProvider = Provider.of<WalletProvider>(context, listen: false);
-      final success = await walletProvider.unlockWallet(
-        credentials == 'biometric' ? '' : credentials,
+      final walletProvider = Provider.of<WalletProvider>(
+        context,
+        listen: false,
       );
+      final success = await walletProvider.unlockWallet(pin);
 
       if (success && mounted) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (context) => const MainScreen()),
-        );
-      } else {
+        await _onUnlockedSuccess();
+      } else if (mounted) {
         setState(() {
           _errorMessage = walletProvider.error ?? 'Failed to unlock wallet';
           _isLoading = false;
         });
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _errorMessage = e.toString();
+        _errorMessage = 'Failed to unlock wallet';
         _isLoading = false;
       });
     }
   }
 
-  void _handleFailedAttempt() {
+  Future<void> _onUnlockedSuccess() async {
+    if (!mounted) return;
+    try {
+      await context.read<WalletCubit>().onUnlocked();
+    } catch (_) {}
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (context) => const MainScreen()),
+    );
+  }
+
+  Future<void> _handleFailedAttempt() async {
+    final attempts = await _securityService.failedAttempts();
+    final lockedOut = await _securityService.isLockedOut();
+    if (!mounted) return;
     setState(() {
-      _failedAttempts++;
+      _failedAttempts = attempts;
       _isLoading = false;
-      
-      if (_failedAttempts >= maxFailedAttempts) {
-        _errorMessage = 'Too many failed attempts. Please restore your wallet.';
+      if (lockedOut) {
+        _errorMessage =
+            'Too many failed attempts. Wallet locked for ${SecurityService.lockoutDuration.inMinutes} minutes.';
       } else {
-        final remainingAttempts = maxFailedAttempts - _failedAttempts;
-        _errorMessage = 'Incorrect PIN. $remainingAttempts attempts remaining.';
+        final remaining = maxFailedAttempts - attempts;
+        _errorMessage =
+            'Incorrect PIN. $remaining attempt${remaining == 1 ? '' : 's'} remaining.';
       }
     });
   }
@@ -160,45 +206,47 @@ class _PinEntryScreenState extends State<PinEntryScreen>
             'Reset Wallet',
             style: TextStyle(color: AppTheme.textPrimary),
           ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'If you\'ve forgotten your PIN, you\'ll need to reset your wallet using your backup phrase.',
-                style: TextStyle(color: AppTheme.textSecondary),
-              ),
-              const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: AppTheme.warningColor.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: AppTheme.warningColor.withOpacity(0.3),
-                  ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'If you\'ve forgotten your PIN, you\'ll need to reset your wallet using your backup phrase.',
+                  style: TextStyle(color: AppTheme.textSecondary),
                 ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.warning,
-                      color: AppTheme.warningColor,
-                      size: 20,
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.warningColor.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: AppTheme.warningColor.withOpacity(0.3),
                     ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'This will remove the current wallet from this device.',
-                        style: TextStyle(
-                          color: AppTheme.textSecondary,
-                          fontSize: 14,
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.warning,
+                        color: AppTheme.warningColor,
+                        size: 20,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'This will remove the current wallet from this device.',
+                          style: TextStyle(
+                            color: AppTheme.textSecondary,
+                            fontSize: 14,
+                          ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -226,11 +274,17 @@ class _PinEntryScreenState extends State<PinEntryScreen>
 
   Future<void> _resetWallet() async {
     try {
+      // Wipe the actual vault files first — clearWalletData() only clears
+      // SecurityService's PIN/seed entries. Without this, the encrypted
+      // vault stays on disk with no PIN to unlock it and no route back to
+      // PinEntryScreen (hasPIN becomes false), stranding the user.
+      final vault = context.read<FuegoVaultService>();
+      await vault.wipe();
       await _securityService.clearWalletData();
-      
+
       if (mounted) {
         Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (context) => const SetupScreen()),
+          MaterialPageRoute(builder: (context) => const MainScreen()),
         );
       }
     } catch (e) {
@@ -249,9 +303,7 @@ class _PinEntryScreenState extends State<PinEntryScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       body: Container(
-        decoration: const BoxDecoration(
-          gradient: AppTheme.backgroundGradient,
-        ),
+        decoration: const BoxDecoration(gradient: AppTheme.backgroundGradient),
         child: SafeArea(
           child: FadeTransition(
             opacity: _fadeAnimation,
@@ -287,8 +339,8 @@ class _PinEntryScreenState extends State<PinEntryScreen>
                       const Text(
                         'Welcome Back',
                         style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
+                          fontSize: 30,
+                          fontWeight: FontWeight.w600,
                           color: AppTheme.textPrimary,
                         ),
                       ),
@@ -319,9 +371,7 @@ class _PinEntryScreenState extends State<PinEntryScreen>
                             SizedBox(height: 16),
                             Text(
                               'Unlocking wallet...',
-                              style: TextStyle(
-                                color: AppTheme.textSecondary,
-                              ),
+                              style: TextStyle(color: AppTheme.textSecondary),
                             ),
                           ],
                         )
@@ -329,12 +379,12 @@ class _PinEntryScreenState extends State<PinEntryScreen>
                         PinInputWidget(
                           onComplete: _onPinComplete,
                           errorMessage: _errorMessage,
-                          showForgotPin: _failedAttempts >= 3,
+                          showForgotPin: true,
                           onForgotPin: _onForgotPin,
                           canUseBiometric: _canUseBiometric,
                           onBiometric: _authenticateWithBiometric,
                         ),
-                        
+
                         // Failed attempts counter
                         if (_failedAttempts > 0) ...[
                           const SizedBox(height: 16),
@@ -361,17 +411,14 @@ class _PinEntryScreenState extends State<PinEntryScreen>
                     ],
                   ),
                 ),
-                
+
                 // Footer
                 Padding(
                   padding: const EdgeInsets.all(16),
                   child: Text(
                     'Your wallet is encrypted and stored securely on this device',
                     textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: AppTheme.textMuted,
-                    ),
+                    style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
                   ),
                 ),
               ],

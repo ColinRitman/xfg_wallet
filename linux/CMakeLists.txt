@@ -4,10 +4,11 @@ project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "fuego_wallet")
+set(BINARY_NAME "fuegowallet")
+set(APP_DISPLAY_NAME "Fuego Valise")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
-set(APPLICATION_ID "com.fuego.fuego_wallet")
+set(APPLICATION_ID "com.fuego.fuegowallet")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -53,6 +54,7 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 # System-level dependencies.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
+pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 
 add_definitions(-DAPPLICATION_ID="${APPLICATION_ID}")
 
@@ -69,10 +71,12 @@ add_executable(${BINARY_NAME}
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
+set_target_properties(${BINARY_NAME} PROPERTIES OUTPUT_NAME "${APP_DISPLAY_NAME}")
 
 # Add dependency libraries. Add any application-specific dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter)
 target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::GTK)
+target_link_libraries(${BINARY_NAME} PRIVATE PkgConfig::X11)
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)

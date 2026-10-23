@@ -1,7 +1,4 @@
-enum NetworkType {
-  mainnet,
-  testnet,
-}
+enum NetworkType { mainnet, testnet }
 
 class NetworkConfig {
   final NetworkType type;
@@ -13,6 +10,8 @@ class NetworkConfig {
   final List<String> seedNodes;
   final String? explorerUrl;
   final String? faucetUrl;
+  final int epochBlocks;
+  final int blockTimeSec;
 
   const NetworkConfig({
     required this.type,
@@ -24,6 +23,8 @@ class NetworkConfig {
     required this.seedNodes,
     this.explorerUrl,
     this.faucetUrl,
+    this.epochBlocks = 900,
+    this.blockTimeSec = 480,
   });
 
   // Mainnet configuration
@@ -33,7 +34,7 @@ class NetworkConfig {
     addressPrefix: 'fire',
     networkId: 'fuego-mainnet',
     daemonRpcPort: 18180,
-    walletRpcPort: 8070,
+    walletRpcPort: 18189,
     seedNodes: [
       '207.244.247.64:18180',
       'node1.usexfg.org:18180',
@@ -43,6 +44,8 @@ class NetworkConfig {
       'fuego.communitynode.net:18180',
     ],
     explorerUrl: 'https://explorer.usexfg.org',
+    epochBlocks: 900,
+    blockTimeSec: 480,
   );
 
   // Testnet configuration
@@ -61,6 +64,8 @@ class NetworkConfig {
     ],
     explorerUrl: 'https://testnet-explorer.usexfg.org',
     faucetUrl: 'https://testnet-faucet.usexfg.org',
+    epochBlocks: 900,
+    blockTimeSec: 480,
   );
 
   // Get configuration by type

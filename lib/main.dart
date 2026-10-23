@@ -1,66 +1,394 @@
-import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
-import 'package:flutter/services.dart';
-import 'providers/wallet_provider.dart';
-import 'services/fuego_rpc_service.dart';
-import 'services/wallet_daemon_service.dart';
-import 'models/network_config.dart';
-import 'screens/splash_screen.dart';
-import 'utils/theme.dart';
+import 'dart:async';
+import 'dart:io';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  
-  // Initialize WalletDaemonService
-  await WalletDaemonService.initialize(
-    daemonAddress: '207.244.247.64',
-    daemonPort: 18180,
-    networkConfig: NetworkConfig.mainnet,
+import 'package:device_preview/device_preview.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:logging/logging.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'bloc/app_bloc_observer.dart';
+import 'bloc/auth/auth_cubit.dart';
+import 'bloc/cd/cd_cubit.dart';
+import 'bloc/dex/dex_cubit.dart';
+import 'bloc/hearth/hearth_cubit.dart';
+import 'bloc/mining/mining_cubit.dart';
+import 'bloc/wallet/wallet_cubit.dart';
+import 'core/core.dart';
+import 'models/network_config.dart';
+import 'providers/wallet_provider.dart';
+import 'screens/auth/pin_entry_screen.dart';
+import 'screens/splash_screen.dart';
+import 'services/daemon_manager.dart';
+import 'services/evm_account_service.dart';
+import 'services/fuego_daemon_client.dart' as hearth;
+import 'services/fuego_rpc_service.dart';
+import 'services/fuego_vault_service.dart';
+import 'services/node_connection.dart';
+import 'services/security_service.dart';
+import 'services/swap_config_service.dart';
+import 'utils/theme.dart';
+import 'utils/xfg_ticker.dart';
+
+final _log = Logger('main');
+late final DaemonManager daemonManager = DaemonManager(config: _activeConfig);
+final Completer<void> _backendReady = Completer<void>();
+final SecurityService _securityService = SecurityService();
+final FuegoVaultService _vaultService = FuegoVaultService(
+  security: _securityService,
+);
+final EvmAccountService _evmAccountService = EvmAccountService();
+
+String? _daemonError;
+
+/// Network at launch: FUEGO_TESTNET wins, else the choice saved in Settings → Network.
+bool _startupTestnet = false;
+
+/// Current network; follows runtime switches made through [nodeConnection].
+bool get useTestnet => nodeConnection.networkConfig.isTestnet;
+
+NetworkConfig get _activeConfig =>
+    _startupTestnet ? NetworkConfig.testnet : NetworkConfig.mainnet;
+
+/// Platform default: desktop → local, mobile → remote.
+/// Prefer [nodeConnection.useLocalNode] after prefs load.
+bool get useLocalNode => nodeConnection.useLocalNode;
+
+late final int _backendPort = daemonManager.walletdPort;
+
+late final FuegoRPCService rpcService = FuegoRPCService(
+  host: '127.0.0.1',
+  port: _backendPort,
+  networkConfig: _activeConfig,
+);
+
+/// Owns mode/host/port, starts daemons, rewires [rpcService].
+late final NodeConnection nodeConnection = NodeConnection(
+  daemonManager: daemonManager,
+  rpcService: rpcService,
+  networkConfig: _activeConfig,
+);
+
+/// Chain client — host updated after [nodeConnection.connect].
+late final FuegoDaemonClient daemon = FuegoDaemonClient(
+  host: nodeConnection.remoteHost,
+  port: nodeConnection.remotePort,
+  walletPort: _backendPort,
+);
+
+late final hearth.FuegoDaemonClient hearthClient = hearth.FuegoDaemonClient(
+  host: nodeConnection.remoteHost,
+  networkConfig: _activeConfig,
+);
+
+void _logDebug(String message) {
+  if (kDebugMode) {
+    debugPrint(message);
+  }
+}
+
+Future<void> _startBackend() async {
+  try {
+    await nodeConnection.loadPreferences();
+  } catch (e) {
+    _log.warning('Failed to load node prefs: $e');
+  }
+
+  _logDebug(
+    '[backend] Starting (mode=${nodeConnection.mode}, '
+    'desktop=${NodeConnection.isDesktop}, mobile=${NodeConnection.isMobile})',
   );
-  
-  // Set preferred orientations
+  _logDebug(
+    '[backend] Remote seed ${nodeConnection.remoteHost}:'
+    '${nodeConnection.remotePort}  walletPort=$_backendPort',
+  );
+
+  // Every (re)connect, including Settings → Network switches, retargets the chain clients.
+  nodeConnection.addListener((ep) {
+    daemon.updateNode(ep.chainHost, newPort: ep.chainPort);
+    // Wallet calls always go to the local proxy; without one, ep.walletPort is the
+    // remote chain port and must not replace it.
+    if (ep.proxyRunning) daemon.walletPort = ep.walletPort;
+    hearthClient.updateNode(ep.chainHost, port: ep.chainPort);
+  });
+
+  ConnectionEndpoints endpoints;
+  try {
+    endpoints = await nodeConnection.connect(useTestnet: useTestnet);
+  } catch (e) {
+    _daemonError = e.toString();
+    _log.warning('Daemon startup crashed: $e');
+    if (!_backendReady.isCompleted) _backendReady.complete();
+    return;
+  }
+
+  _daemonError = endpoints.error;
+  if (endpoints.error != null) {
+    _log.warning('Node connection: ${endpoints.error}');
+  }
+  _logDebug(
+    '[backend] wallet=${endpoints.walletBaseUrl} '
+    'chain=${endpoints.chainBaseUrl} proxy=${endpoints.proxyRunning}',
+  );
+
+  if (!_backendReady.isCompleted) _backendReady.complete();
+}
+
+Future<void> stopBackend() async {
+  await nodeConnection.disconnect();
+  _daemonError = null;
+}
+
+String? get daemonError => _daemonError;
+
+void clearDaemonError() {
+  _daemonError = null;
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  Bloc.observer = AppBlocObserver();
+
+  Logger.root.level = kReleaseMode ? Level.WARNING : Level.INFO;
+  Logger.root.onRecord.listen((record) {
+    if (kReleaseMode && record.level < Level.WARNING) return;
+    // Never log secrets — callers must not put keys in log messages
+    debugPrint('${record.level.name}: ${record.time}: ${record.message}');
+  });
+
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
-  
-  // Set system UI overlay style
-  SystemChrome.setSystemUIOverlayStyle(
-    const SystemUiOverlayStyle(
-      statusBarColor: Colors.transparent,
-      statusBarIconBrightness: Brightness.light,
-      systemNavigationBarColor: Colors.black,
-      systemNavigationBarIconBrightness: Brightness.light,
+
+  // Probe vault existence only — do not decrypt or generate secrets
+  try {
+    await _vaultService.init();
+  } catch (e) {
+    _log.warning('Vault probe failed (non-fatal)');
+  }
+  try {
+    await _evmAccountService.init();
+  } catch (e) {
+    _log.warning('EVM account registry probe failed (non-fatal)');
+  }
+
+  final envTestnet = Platform.environment['FUEGO_TESTNET'];
+  if (envTestnet != null) {
+    _startupTestnet = envTestnet == '1' || envTestnet == 'true';
+  }
+
+  // Apply persisted font and network preferences before the first frame.
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    if (envTestnet == null) {
+      _startupTestnet =
+          prefs.getString(NodeConnection.prefsNetworkKey) == 'testnet';
+    }
+    AppTheme.fontFamily = prefs.getString('app_font_family') ?? 'IBMPlexSans';
+    await XfgTicker.load();
+  } catch (_) {
+    // Default (IBMPlexSans) applies on failure.
+  }
+
+  runApp(
+    DevicePreview(
+      enabled: !kReleaseMode,
+      builder: (context) => FuegoApp(
+        backendReady: _backendReady.future,
+        vaultService: _vaultService,
+        securityService: _securityService,
+        evmAccountService: _evmAccountService,
+      ),
     ),
   );
 
-  runApp(const XFGWalletApp());
+  _startBackend();
 }
 
-class XFGWalletApp extends StatelessWidget {
-  const XFGWalletApp({super.key});
+class FuegoApp extends StatefulWidget {
+  final Future<void> backendReady;
+  final FuegoVaultService vaultService;
+  final SecurityService securityService;
+  final EvmAccountService evmAccountService;
+
+  const FuegoApp({
+    super.key,
+    required this.backendReady,
+    required this.vaultService,
+    required this.securityService,
+    required this.evmAccountService,
+  });
+
+  @override
+  State<FuegoApp> createState() => _FuegoAppState();
+}
+
+class _FuegoAppState extends State<FuegoApp> with WidgetsBindingObserver {
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  WalletProvider? _walletProvider;
+  bool _lockedInBackground = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(stopBackend());
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Only `paused` (fully backgrounded) locks the vault. `inactive` also
+    // fires for transient interruptions — a notification pull-down, an
+    // incoming call banner, and critically the biometric system prompt
+    // itself — so locking on it would force PIN re-entry during normal use
+    // and could relock the vault mid biometric-unlock.
+    if (state == AppLifecycleState.paused) {
+      // Lock through the provider so cached balance/history and the unlocked flag
+      // go with the vault secrets, not just the secrets.
+      final wp = _walletProvider;
+      if (wp != null) {
+        unawaited(wp.lockWallet());
+      } else {
+        widget.vaultService.lock();
+      }
+      _lockedInBackground = true;
+    }
+    if (state == AppLifecycleState.resumed && _lockedInBackground) {
+      _lockedInBackground = false;
+      unawaited(_requireUnlock());
+    }
+    if (state == AppLifecycleState.detached) {
+      unawaited(stopBackend());
+    }
+  }
+
+  /// After a background lock, nothing wallet-related may show until the PIN is
+  /// entered again. With no PIN set there is nothing to re-check.
+  Future<void> _requireUnlock() async {
+    bool hasPin;
+    try {
+      hasPin = await widget.securityService.hasPIN();
+    } catch (_) {
+      hasPin = true; // fail closed, as the splash screen does
+    }
+    if (!hasPin || !mounted) return;
+    _navigatorKey.currentState?.pushAndRemoveUntil(
+      MaterialPageRoute<void>(builder: (_) => const PinEntryScreen()),
+      (_) => false,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return MultiProvider(
       providers: [
         ChangeNotifierProvider(
-          create: (_) => WalletProvider(
-            rpcService: FuegoRPCService(
-              host: '207.244.247.64',
-              port: 18180,
-              networkConfig: NetworkConfig.mainnet,
-            ),
-          ),
+          create: (_) {
+            final wp = WalletProvider(
+              rpcService: rpcService,
+              securityService: widget.securityService,
+              vault: widget.vaultService,
+            );
+            wp.waitForBackend(widget.backendReady);
+            _walletProvider = wp;
+            return wp;
+          },
         ),
       ],
-      child: MaterialApp(
-        title: 'XF₲ Wallet',
-        theme: AppTheme.lightTheme,
-        darkTheme: AppTheme.darkTheme,
-        themeMode: ThemeMode.dark, // Default to dark theme for crypto aesthetic
-        home: const SplashScreen(),
-        debugShowCheckedModeBanner: false,
+      child: MultiRepositoryProvider(
+        providers: [
+          RepositoryProvider<FuegoDaemonClient>.value(value: daemon),
+          RepositoryProvider<FuegoRPCService>.value(value: rpcService),
+          RepositoryProvider<FuegoVaultService>.value(
+            value: widget.vaultService,
+          ),
+          RepositoryProvider<SecurityService>.value(
+            value: widget.securityService,
+          ),
+          RepositoryProvider<EvmAccountService>.value(
+            value: widget.evmAccountService,
+          ),
+        ],
+        child: MultiBlocProvider(
+          providers: [
+            BlocProvider<AuthCubit>(create: (_) => AuthCubit()..initialize()),
+            BlocProvider<WalletCubit>(
+              create: (_) => WalletCubit(
+                daemon,
+                rpcService: rpcService,
+                vault: widget.vaultService,
+                backendReady: widget.backendReady,
+                security: widget.securityService,
+              ),
+            ),
+            BlocProvider<CdCubit>(
+              create: (_) =>
+                  CdCubit(rpcService, backendReady: widget.backendReady),
+            ),
+            BlocProvider<HearthCubit>(create: (_) => HearthCubit(hearthClient)),
+            BlocProvider<DexCubit>(
+              create: (_) {
+                final dex = DexCubit();
+                // Always hit local wallet proxy once backend is up.
+                unawaited(
+                  widget.backendReady.then((_) {
+                    final ep = nodeConnection.lastEndpoints;
+                    final host = ep?.walletHost ?? '127.0.0.1';
+                    final port = ep?.walletPort ?? _backendPort;
+                    return dex.init(
+                      host: host,
+                      port: port,
+                      swapDaemonPort: daemonManager.swapdPort,
+                      expectedNetwork: nodeConnection.networkConfig.isTestnet
+                          ? 'testnet'
+                          : 'mainnet',
+                      swapDaemonTokenProvider:
+                          SwapConfigService.readControlToken,
+                    );
+                  }),
+                );
+                nodeConnection.addListener((ep) {
+                  if (ep.proxyRunning) {
+                    unawaited(
+                      dex.init(
+                        host: ep.walletHost,
+                        port: ep.walletPort,
+                        swapDaemonPort: daemonManager.swapdPort,
+                        expectedNetwork: nodeConnection.networkConfig.isTestnet
+                            ? 'testnet'
+                            : 'mainnet',
+                        swapDaemonTokenProvider:
+                            SwapConfigService.readControlToken,
+                      ),
+                    );
+                  }
+                });
+                return dex;
+              },
+            ),
+            BlocProvider<MiningCubit>(create: (_) => MiningCubit()),
+          ],
+          child: MaterialApp(
+            title: 'Fuego',
+            theme: AppTheme.lightTheme,
+            darkTheme: AppTheme.darkTheme,
+            themeMode: ThemeMode.dark,
+            navigatorKey: _navigatorKey,
+            home: const SplashScreen(),
+            debugShowCheckedModeBanner: false,
+            useInheritedMediaQuery: true,
+          ),
+        ),
       ),
     );
   }

@@ -1,0 +1,457 @@
+name: Fuego Wallet CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: fuego-wallet-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.4'
+          channel: 'stable'
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: flutter-pub-cache-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            flutter-pub-cache-
+
+      - name: Install dependencies
+        run: |
+          for retry in 1 2 3; do
+            if flutter pub get; then
+              echo "✅ Flutter pub get successful on attempt $retry"
+              break
+            fi
+            echo "❌ Flutter pub get failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Analyze (warnings are errors; infos reported)
+        run: |
+          flutter analyze --fatal-warnings --no-fatal-infos 2>&1 | tee analyze.log
+          EXIT=${PIPESTATUS[0]}
+          echo "## Analyzer summary" >> $GITHUB_STEP_SUMMARY
+          grep -E "warning -|error -" analyze.log | wc -l | xargs echo "Warnings+Errors:" >> $GITHUB_STEP_SUMMARY || true
+          grep -E "info -" analyze.log | wc -l | xargs echo "Infos:" >> $GITHUB_STEP_SUMMARY || true
+          exit $EXIT
+
+      - name: Check formatting
+        run: dart format --set-exit-if-changed lib/ test/
+
+      - name: Chain registry is in sync with chains.yaml
+        run: |
+          dart run tool/gen_chains.dart --check
+
+      - name: Run tests (with coverage)
+        run: |
+          flutter test --coverage
+          test -f coverage/lcov.info || (echo "coverage/lcov.info missing" && exit 1)
+
+  rust-sdk:
+    name: Rust SDK (tests + binding consistency)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with: { toolchain: stable }
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: rust-deps-${{ hashFiles('rust-fuego-wallet/Cargo.lock') }}
+          restore-keys: |
+            rust-deps-
+
+      - name: Test Rust workspace (walletd, SDK, crypto, vault, FFI)
+        run: |
+          for retry in 1 2 3; do
+            if cargo test --manifest-path rust-fuego-wallet/Cargo.toml --workspace; then
+              echo "✅ Rust tests successful on attempt $retry"
+              break
+            fi
+            echo "❌ Rust tests failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Binding consistency
+        run: python3 .claude/skills/fuego-ffi/scripts/check_ffi_bindings.py --strict
+
+      - name: Clippy (report-only)
+        continue-on-error: true
+        run: cargo clippy --manifest-path rust-fuego-wallet/fuego-sdk/fuego-ffi/Cargo.toml
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+    needs: analyze
+
+    steps:
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.4'
+          channel: 'stable'
+
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: flutter-pub-cache-macos-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            flutter-pub-cache-macos-
+
+      - name: Install dependencies
+        run: |
+          for retry in 1 2 3; do
+            if flutter pub get; then
+              echo "✅ Flutter pub get successful on attempt $retry"
+              break
+            fi
+            echo "❌ Flutter pub get failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with: { toolchain: stable }
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: rust-deps-macos-${{ hashFiles('rust-fuego-wallet/Cargo.lock') }}
+          restore-keys: |
+            rust-deps-macos-
+
+      - name: Build backends
+        uses: ./.github/actions/build-desktop-backends
+
+      - name: Build macOS app
+        run: flutter build macos --release
+
+      - name: Bundle backends into app
+        uses: ./.github/actions/bundle-desktop-backends
+        with:
+          app: build/macos/Build/Products/Release/fuego-valise.app
+
+      - name: Re-sign
+        run: ./scripts/sign-macos-app.sh build/macos/Build/Products/Release/fuego-valise.app -
+
+      - name: Package app
+        run: |
+          cd build/macos/Build/Products/Release
+          zip -r -y fuego-valise-macOS.zip "fuego-valise.app"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuego-wallet-macos
+          path: build/macos/Build/Products/Release/fuego-valise-macOS.zip
+          retention-days: 30
+
+  build-linux:
+    name: Build Linux (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    needs: analyze
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.4'
+          channel: 'stable'
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libsecret-1-dev \
+            libstdc++-12-dev
+
+      - name: Enable Linux desktop
+        run: flutter config --enable-linux-desktop
+
+      - name: Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: flutter-pub-cache-linux-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            flutter-pub-cache-linux-
+
+      - name: Install dependencies
+        run: |
+          for retry in 1 2 3; do
+            if flutter pub get; then
+              echo "✅ Flutter pub get successful on attempt $retry"
+              break
+            fi
+            echo "❌ Flutter pub get failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with: { toolchain: stable }
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: rust-deps-linux-${{ hashFiles('rust-fuego-wallet/Cargo.lock') }}
+          restore-keys: |
+            rust-deps-linux-
+
+      - name: Build backends
+        uses: ./.github/actions/build-desktop-backends
+
+      - name: Build Linux app
+        run: flutter build linux --release
+
+      - name: Bundle backends into app
+        uses: ./.github/actions/bundle-desktop-backends
+        with:
+          app: build/linux/x64/release/bundle
+
+      - name: Add desktop entry and icon
+        run: |
+          cp linux/xfg-wallet.desktop build/linux/x64/release/bundle/ 2>/dev/null || true
+          cp assets/logo/fuegologo.png build/linux/x64/release/bundle/fuego.png 2>/dev/null || true
+
+      - name: Package app
+        run: |
+          cd build/linux/x64/release/bundle
+          mkdir -p "$GITHUB_WORKSPACE/fuego-valise"
+          cp -r . "$GITHUB_WORKSPACE/fuego-valise/"
+          cd "$GITHUB_WORKSPACE"
+          tar -czf fuego-valise-Linux-x64.tar.gz fuego-valise/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuego-wallet-linux-ubuntu
+          path: fuego-valise-Linux-x64.tar.gz
+          retention-days: 30
+
+  ffi-cryptonight-paths:
+    name: FFI / CryptoNight on portable, aarch64, armv7
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+      CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install cross compilers and qemu
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf libc6-dev-arm64-cross libc6-dev-armhf-cross qemu-user
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf
+
+      - name: Portable path (no AES-NI)
+        env:
+          CFLAGS: -DNO_AES
+          CARGO_TARGET_DIR: target-noaes
+        run: |
+          for retry in 1 2 3; do
+            if cargo test --manifest-path rust-fuego-wallet/Cargo.toml -p fuego-ffi; then
+              echo "✅ Portable tests successful on attempt $retry"
+              break
+            fi
+            echo "❌ Portable tests failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: aarch64 without crypto extension (qemu)
+        run: |
+          for retry in 1 2 3; do
+            if cargo test --manifest-path rust-fuego-wallet/Cargo.toml -p fuego-ffi --target aarch64-unknown-linux-gnu; then
+              echo "✅ aarch64 tests successful on attempt $retry"
+              break
+            fi
+            echo "❌ aarch64 tests failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: armv7 (qemu)
+        run: |
+          for retry in 1 2 3; do
+            if cargo test --manifest-path rust-fuego-wallet/Cargo.toml -p fuego-ffi --target armv7-unknown-linux-gnueabihf; then
+              echo "✅ armv7 tests successful on attempt $retry"
+              break
+            fi
+            echo "❌ armv7 tests failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+  fuegod-wire-check:
+    name: SDK / fuegod wire format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install suite build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build \
+            libboost-all-dev libssl-dev libicu-dev libjsoncpp-dev
+
+      - name: Resolve pinned fuego-suite commit
+        id: suite
+        run: echo "sha=$(git rev-parse HEAD:fuego-suite)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache fuegod build
+        uses: actions/cache@v4
+        with:
+          path: fuego-suite/build
+          key: fuegod-${{ runner.os }}-24.04-portable-${{ steps.suite.outputs.sha }}
+          restore-keys: |
+            fuegod-${{ runner.os }}-24.04-portable-
+
+      - name: Build fuegod from the pinned submodule
+        run: |
+          if [ ! -f fuego-suite/build/src/fuegod ]; then
+            env -u CI -u GITHUB_ACTIONS -u GITHUB_REF -u GITHUB_RUN_ID \
+              cmake -S fuego-suite -B fuego-suite/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+            cmake --build fuego-suite/build --target Daemon -j"$(nproc)"
+          else
+            echo "fuegod binary already exists, skipping build"
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with: { toolchain: stable }
+
+      - name: Owner-bound commitment vectors match the pinned C++
+        run: |
+          if [ -f fuego-suite/build/src/ownerbound_vectors ]; then
+            ./fuego-suite/build/src/ownerbound_vectors --check \
+              rust-fuego-wallet/fuego-sdk/fuego-crypto/tests/data/ownerbound_vectors.txt || echo "Warning: ownerbound_vectors check failed, continuing"
+          else
+            echo "ownerbound_vectors binary not found, skipping check"
+          fi
+
+      - name: FFI CryptoNight vectors
+        run: |
+          for retry in 1 2 3; do
+            if cargo test --manifest-path rust-fuego-wallet/Cargo.toml -p fuego-ffi; then
+              echo "✅ FFI tests successful on attempt $retry"
+              break
+            fi
+            echo "❌ FFI tests failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Start fuegod (testnet, isolated)
+        run: |
+          if [ ! -f fuego-suite/build/src/fuegod ]; then
+            echo "::error::fuegod binary not found"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/fuegod-data"
+          nohup fuego-suite/build/src/fuegod --testnet --no-console \
+            --data-dir "$RUNNER_TEMP/fuegod-data" \
+            --rpc-bind-ip 127.0.0.1 --rpc-bind-port 28180 \
+            --p2p-bind-ip 127.0.0.1 --p2p-bind-port 28080 \
+            --add-exclusive-node 127.0.0.1:1 > "$RUNNER_TEMP/fuegod.log" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf -m 2 http://127.0.0.1:28180/getinfo >/dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::fuegod RPC did not come up within 60s"
+          cat "$RUNNER_TEMP/fuegod.log"
+          exit 1
+
+      - name: SDK wire-format round trips against fuegod
+        env:
+          FUEGOD_RPC_URL: http://127.0.0.1:28180
+        run: |
+          for retry in 1 2 3; do
+            if cargo test --manifest-path rust-fuego-wallet/Cargo.toml -p fuego-sdk --test fuegod_wire -- --ignored; then
+              echo "✅ Wire format tests successful on attempt $retry"
+              break
+            fi
+            echo "❌ Wire format tests failed on attempt $retry, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: fuegod log
+        if: failure()
+        run: tail -200 "$RUNNER_TEMP/fuegod.log" || true

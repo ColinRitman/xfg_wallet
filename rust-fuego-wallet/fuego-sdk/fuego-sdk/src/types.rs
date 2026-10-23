@@ -1,0 +1,482 @@
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
+
+// ── Swap / Orderbook types ────────────────────────────────────────
+
+/// Trading pair for swap offers.
+/// IDs match fuego-suite: SOL=0, ETH=1, XMR=2, BCH=3, ARB=4, BASE=5, KMD=6, BNB=7, DCR=8, BTC=9, LTC=10, POLY=11
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SwapPair {
+    XfgSol = 0,
+    XfgEth = 1,
+    XfgXmr = 2,
+    XfgBch = 3,
+    XfgArb = 4,
+    XfgBase = 5,
+    XfgKmd = 6,
+    XfgBnb = 7,
+    XfgDcr = 8,
+    XfgBtc = 9,
+    XfgLtc = 10,
+    XfgPoly = 11,
+}
+
+impl SwapPair {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::XfgSol => "XFG/SOL",
+            Self::XfgEth => "XFG/ETH",
+            Self::XfgXmr => "XFG/XMR",
+            Self::XfgBch => "XFG/BCH",
+            Self::XfgArb => "XFG/ARB",
+            Self::XfgBase => "XFG/BASE",
+            Self::XfgKmd => "XFG/KMD",
+            Self::XfgBnb => "XFG/BNB",
+            Self::XfgDcr => "XFG/DCR",
+            Self::XfgBtc => "XFG/BTC",
+            Self::XfgLtc => "XFG/LTC",
+            Self::XfgPoly => "XFG/POLY",
+        }
+    }
+
+    pub fn ticker(&self) -> &'static str {
+        match self {
+            Self::XfgSol => "SOL",
+            Self::XfgEth => "ETH",
+            Self::XfgXmr => "XMR",
+            Self::XfgBch => "BCH",
+            Self::XfgArb => "ARB",
+            Self::XfgBase => "BASE",
+            Self::XfgKmd => "KMD",
+            Self::XfgBnb => "BNB",
+            Self::XfgDcr => "DCR",
+            Self::XfgBtc => "BTC",
+            Self::XfgLtc => "LTC",
+            Self::XfgPoly => "POLY",
+        }
+    }
+
+    pub fn chain_type(&self) -> crate::chain::ChainType {
+        match self {
+            Self::XfgSol => crate::chain::ChainType::Solana,
+            Self::XfgEth => crate::chain::ChainType::Ethereum,
+            Self::XfgXmr => crate::chain::ChainType::Monero,
+            Self::XfgBch => crate::chain::ChainType::BitcoinCash,
+            Self::XfgArb => crate::chain::ChainType::Arbitrum,
+            Self::XfgBase => crate::chain::ChainType::Base,
+            Self::XfgKmd => crate::chain::ChainType::Komodo,
+            Self::XfgBnb => crate::chain::ChainType::Bnb,
+            Self::XfgDcr => crate::chain::ChainType::Decred,
+            Self::XfgBtc => crate::chain::ChainType::Bitcoin,
+            Self::XfgLtc => crate::chain::ChainType::Litecoin,
+            Self::XfgPoly => crate::chain::ChainType::Polygon,
+        }
+    }
+
+    pub fn all() -> &'static [SwapPair] {
+        &[
+            Self::XfgSol,
+            Self::XfgEth,
+            Self::XfgXmr,
+            Self::XfgBch,
+            Self::XfgArb,
+            Self::XfgBase,
+            Self::XfgKmd,
+            Self::XfgBnb,
+            Self::XfgDcr,
+            Self::XfgBtc,
+            Self::XfgLtc,
+            Self::XfgPoly,
+        ]
+    }
+
+    pub fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::XfgSol),
+            1 => Some(Self::XfgEth),
+            2 => Some(Self::XfgXmr),
+            3 => Some(Self::XfgBch),
+            4 => Some(Self::XfgArb),
+            5 => Some(Self::XfgBase),
+            6 => Some(Self::XfgKmd),
+            7 => Some(Self::XfgBnb),
+            8 => Some(Self::XfgDcr),
+            9 => Some(Self::XfgBtc),
+            10 => Some(Self::XfgLtc),
+            11 => Some(Self::XfgPoly),
+            _ => None,
+        }
+    }
+
+    pub fn from_id_str(ticker: &str) -> Option<Self> {
+        match ticker.to_uppercase().as_str() {
+            "SOL" => Some(Self::XfgSol),
+            "ETH" => Some(Self::XfgEth),
+            "XMR" => Some(Self::XfgXmr),
+            "BCH" => Some(Self::XfgBch),
+            "ARB" => Some(Self::XfgArb),
+            "BASE" => Some(Self::XfgBase),
+            "KMD" => Some(Self::XfgKmd),
+            "BNB" => Some(Self::XfgBnb),
+            "DCR" => Some(Self::XfgDcr),
+            "BTC" => Some(Self::XfgBtc),
+            "LTC" => Some(Self::XfgLtc),
+            "POLY" | "POLYGON" => Some(Self::XfgPoly),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SwapPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Swap offer on the orderbook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapOffer {
+    pub offer_id: String,
+    pub maker_pubkey: String,
+    pub pair: SwapPair,
+    pub sell_xfg: bool,
+    pub amount: String,
+    pub price: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/// Signed swap offer for submission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedOffer {
+    pub offer: SwapOffer,
+    pub signature: String,
+}
+
+/// Price data for a trading pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapPriceResponse {
+    pub pair: SwapPair,
+    pub bid: String,
+    pub ask: String,
+    pub last: String,
+    pub volume_24h: String,
+    pub change_24h: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Historical trade record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapTrade {
+    pub trade_id: String,
+    pub pair: SwapPair,
+    pub sell_xfg: bool,
+    pub amount: String,
+    pub price: String,
+    pub timestamp: u64,
+}
+
+/// Active swap status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapStatus {
+    pub swap_id: String,
+    pub state: SwapState,
+    pub pair: SwapPair,
+    pub amount: String,
+    pub maker_pubkey: String,
+    pub taker_pubkey: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// Swap state machine states.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SwapState {
+    /// Maker has posted offer.
+    Open,
+    /// Taker has matched an offer.
+    Matched,
+    /// Maker has locked funds (adaptor sig sent).
+    MakerLocked,
+    /// Taker has locked funds (adaptor sig sent).
+    TakerLocked,
+    /// Maker has revealed preimage.
+    MakerRevealed,
+    /// Swap completed successfully.
+    Completed,
+    /// Swap was cancelled or expired.
+    Cancelled,
+}
+
+/// Orderbook state snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderBookState {
+    pub bids: Vec<OrderLevel>,
+    pub asks: Vec<OrderLevel>,
+    pub last_price: String,
+    pub volume_24h: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderLevel {
+    pub price: String,
+    pub amount: String,
+    pub count: u32,
+}
+
+/// Fuego price data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuegoPrice {
+    pub usd: String,
+    pub btc: String,
+    pub eth: String,
+    pub market_cap: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+// ── Certificate of Deposit types ──────────────────────────────────
+
+/// CD listing on the market.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdListing {
+    pub cd_id: String,
+    pub owner_pubkey: String,
+    pub amount: u64,
+    pub term_days: u32,
+    pub apy: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/// CD offer for purchase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdOffer {
+    pub offer_id: String,
+    pub cd_id: String,
+    pub ask_price: String,
+    pub created_at: u64,
+}
+
+/// User's CD record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyCd {
+    pub cd_id: String,
+    pub amount: u64,
+    pub term_days: u32,
+    pub apy: String,
+    pub created_at: u64,
+    pub matures_at: u64,
+    pub is_active: bool,
+}
+
+/// Fuego address (Base58 CryptoNote format)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Address(pub String);
+
+impl Address {
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self(addr.into())
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<&str> for Address {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl From<String> for Address {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// Public key (32 bytes Ed25519)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicKey(pub [u8; 32]);
+
+impl zeroize::Zeroize for PublicKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Secret key (32 bytes)
+#[derive(Debug, Zeroize)]
+#[zeroize(drop)]
+pub struct SecretKey(pub(crate) [u8; 32]);
+
+impl SecretKey {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Keypair for signing
+#[derive(Debug, Zeroize)]
+#[zeroize(drop)]
+pub struct Keypair {
+    pub secret: SecretKey,
+    pub public: PublicKey,
+}
+
+/// Block header
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockHeader {
+    pub height: u64,
+    pub hash: [u8; 32],
+    pub prev_hash: [u8; 32],
+    pub timestamp: u64,
+    pub tx_count: u32,
+}
+
+/// Block with transactions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Block {
+    pub header: BlockHeader,
+    pub transactions: Vec<Transaction>,
+}
+
+/// Transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transaction {
+    pub hash: [u8; 32],
+    pub inputs: Vec<TxInput>,
+    pub outputs: Vec<TxOutput>,
+    pub extra: Vec<u8>,
+    pub fee: u64,
+}
+
+/// Transaction input
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxInput {
+    pub prev_tx_hash: [u8; 32],
+    pub prev_output_index: u32,
+    pub signature: Vec<u8>,
+}
+
+/// Transaction output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxOutput {
+    pub amount: u64,
+    pub pubkey: [u8; 32],
+}
+
+/// UTXO (Unspent Transaction Output)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Utxo {
+    pub tx_hash: [u8; 32],
+    pub output_index: u32,
+    pub amount: u64,
+    pub pubkey: [u8; 32],
+    pub height: u64,
+}
+
+/// Network sync status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub current_height: u64,
+    pub target_height: u64,
+    pub is_syncing: bool,
+    pub last_sync_time: Option<u64>,
+}
+
+/// Node configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    pub data_dir: String,
+    pub network: NetworkType,
+    pub max_peers: usize,
+    pub sync_interval_secs: u64,
+    pub enable_seeding: bool,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: "./fuego-data".to_string(),
+            network: NetworkType::Mainnet,
+            max_peers: 50,
+            sync_interval_secs: 30,
+            enable_seeding: false,
+        }
+    }
+}
+
+/// Network type
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum NetworkType {
+    Mainnet,
+    Testnet,
+    Stagenet,
+}
+
+/// Balance breakdown
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Balance {
+    pub confirmed: u64,
+    pub pending: u64,
+    pub immature: u64,
+}
+
+impl Balance {
+    pub fn total(&self) -> u64 {
+        self.confirmed.saturating_add(self.pending).saturating_add(self.immature)
+    }
+}
+
+/// Transaction builder
+pub struct TxBuilder {
+    inputs: Vec<TxInput>,
+    outputs: Vec<TxOutput>,
+    extra: Vec<u8>,
+}
+
+impl Default for TxBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TxBuilder {
+    pub fn new() -> Self {
+        Self {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            extra: Vec::new(),
+        }
+    }
+
+    pub fn add_input(mut self, input: TxInput) -> Self {
+        self.inputs.push(input);
+        self
+    }
+
+    pub fn add_output(mut self, amount: u64, pubkey: [u8; 32]) -> Self {
+        self.outputs.push(TxOutput { amount, pubkey });
+        self
+    }
+
+    pub fn set_extra(mut self, extra: Vec<u8>) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn build(self) -> Transaction {
+        Transaction {
+            hash: [0; 32],
+            inputs: self.inputs,
+            outputs: self.outputs,
+            extra: self.extra,
+            fee: 0,
+        }
+    }
+}

@@ -1,0 +1,223 @@
+# AGENTS.md — Fuego Wallet Architecture Reference
+
+## Swap Architecture (Dual-Mode)
+
+The Fuego swap system uses **two daemons** that serve different purposes:
+
+### fuegod (port 18180)
+- Main CryptoNote blockchain node
+- Has an **embedded SwapDaemon** for XFG-side operations (escrow, ring signatures, state machine)
+- RPC endpoints: `/getswapoffers`, `/getswapprice`, `/getswaptrades`, `/submitswap`, `/cancelswap`, `/requestswap`, `/initiate`, `/accept`, `/processswap`, `/refundswap`, `/getactiveswaps`, `/listswaps`, `/getswapstatus`
+- Does NOT configure counterparty chain clients (BTC, ETH, SOL, etc.)
+- Used by: Dart wallet tabs 1-3 (Orderbook, Trade, Trades)
+
+### xfg-swapd (port 18902)
+- Standalone swap daemon for cross-chain atomic swaps
+- Has its own JSON-RPC HTTP server on port 18902, status server on 18900, P2P on 18901
+- Configurable via `--swap-config` JSON with chain RPC endpoints and signer keys
+- Supports all 12 counterparty chains with SPV or RPC verification
+- Connects to fuegod as an RPC client for Fuego chain operations
+- Used by: Dart wallet Cross-Chain tab
+- Built from: `src/SwapDaemon/` in the fuego C++ repo
+
+### Why Both Are Needed
+- Fuegod handles Fuego-side escrow and ring signatures only
+- xfg-swapd handles actual cross-chain lock/claim/refund on BTC, ETH, SOL, etc.
+- They use **separate databases** (fuegod: `<configFolder>/swaps`, xfg-swapd: `~/.xfg-swapd`)
+
+## Supported Swap Chains (12 pairs)
+
+| ID | Chain | Adapter | Connection | HTLC Type |
+|----|-------|---------|-----------|-----------|
+| 0 | SOL | `SolChainClient` | Solana JSON-RPC | On-chain program |
+| 1 | ETH | `EthChainClient` | Ethereum JSON-RPC | HashedTimelock.sol |
+| 2 | XMR | `XmrChainClient` | monerod + monero-wallet-rpc | Ring sigs + adaptor sigs |
+| 3 | BCH | `BchChainClient` | Electrum SPV or bitcoind RPC | P2SH |
+| 4 | ARB | `EthChainClient` | Arbitrum JSON-RPC | HashedTimelock.sol |
+| 5 | BASE | `EthChainClient` | Base JSON-RPC | HashedTimelock.sol |
+| 6 | KMD | `KmdChainClient` | Electrum SPV or komodod RPC | P2SH |
+| 7 | BNB | `BscChainClient` | BSC JSON-RPC | HashedTimelock.sol |
+| 8 | DCR | `DcrChainClient` | Neutrino SPV (BIP-157/158) or dcrd RPC | P2SH |
+| 9 | BTC | `BtcChainClient` | Electrum SPV or bitcoind RPC | P2WSH SegWit |
+| 10 | LTC | `LtcChainClient` | Electrum SPV or litecoind RPC | P2WSH SegWit |
+| 11 | POLYGON | `PolygonChainClient` | Polygon JSON-RPC | HashedTimelock.sol |
+
+### Chain Connection Modes
+- **SPV mode**: Read-only verification via Electrum protocol (BTC/LTC/BCH/KMD) or Neutrino (DCR). Cannot create lock transactions — claim/refund needs RPC mode.
+- **RPC mode**: Full node connection with `-txindex`. Required for sending transactions.
+- **EVM chains**: JSON-RPC only (no SPV). Share same HashedTimelock.sol contract. Public RPCs (Infura/Alchemy) used by default — no user setup needed.
+- **SOL**: JSON-RPC + on-chain HTLC program. Public RPC used by default — no user setup needed.
+- **XMR**: CryptoNote ring signatures — no SPV proof possible. Run your own `monerod` + `monero-wallet-rpc` (recommended) or use a remote node from [monero.fail](https://monero.fail).
+
+### What Users Need To Run
+| Chain | User Action Required? |
+|-------|----------------------|
+| BTC, LTC, BCH, KMD | None — Electrum SPV handles verification via public servers |
+| ETH, ARB, BASE, BNB, POLYGON | None — public JSON-RPC used by default |
+| SOL | None — public Solana RPC used by default |
+| DCR | None for SPV mode (Neutrino built-in) |
+| XMR | Run your own monerod + monero-wallet-rpc (recommended), or use a remote node from monero.fail |
+
+### Known Issues
+
+- SPV mode is read-only; claim/refund requires RPC mode for UTXO chains.
+- **The chain set is mirrored by hand in many places, and has drifted before.** One `SwapPair`
+  enum is restated as ~10 C++ `switch` tables, a Go CLI list, dashboard JS/HTML, and ~10 lists
+  in Dart. Adding a chain is a ~40-item cross-language checklist. The live landmines, all of
+  which fail *silently* rather than at compile time:
+  - `src/CryptoNoteCore/SwapOfferRelay.h` `MAX_PAIR_INDEX` is hand-synced across the module
+    boundary. Raising `SwapPair` without raising it drops every offer for the new pair in
+    `validateOffer`.
+  - `for (pair = 0; pair <= SwapPair::DOT; ++pair)` loop sentinels (`src/Rpc/RpcServer.cpp`,
+    `src/SwapDaemon/SwapDaemon.cpp`) compile fine and silently skip a newly appended pair.
+  - `PriceOracle::ctrDivisor()` defaults to a *plausible-but-wrong* `1e8`, unlike
+    `getEffectiveRate()` which returns an obvious `0.0`. A missing case corrupts
+    `requiredCtrAmount` in integer math.
+  - `swapPairFromString()` guards `s.size() > 12` before any comparison, so a chain name
+    longer than 12 chars is unparseable.
+- `swapxfg/app/pairs.go` (`ActivePairs`) covers 7 of 29 pairs, and
+  `dashboard/static/js/swapxfg.js` `CHAIN_INFO` covers 10 of 29 — the Go CLI and the
+  dashboard can only see a fraction of what the daemon supports.
+- `swap_config.example.json` uses key names `ChainClientConfig.cpp` never reads (`btc_host`
+  vs `btc_rpc_host`, `eth_wif` vs `eth_priv_key`). Following it verbatim yields a silently
+  unconfigured daemon.
+- `src/SwapDaemon/CLV/` is a fully-written `EthChainClient` subclass with no `SwapPair` value,
+  config field, registration, or CMake entry — an orphan adapter.
+
+## Dart Wallet Backend Architecture
+
+### Backend Startup (main.dart + NodeConnection)
+- `NodeConnection` is the single source of truth for local vs remote mode
+- Platform defaults: **desktop → local**, **mobile → remote** (override via prefs or `FUEGO_USE_LOCAL_NODE`)
+- **Local**: `fuego_walletd -P 18189 serve --local --await-wallet` (embedded fuegod; never spawn a separate fuegod in remote mode)
+- **Remote**: `fuego_walletd -P 18189 serve --daemon-host <seed> --daemon-port <port> --await-wallet` — local proxy always preferred
+- Wallet JSON-RPC always targets `http://127.0.0.1:18189` when the proxy is up
+- Desktop local failure auto-falls back to remote proxy + seed failover across `NetworkConfig.seedNodes`
+- Health: `/health` or JSON-RPC `getHealth` on 18189 (up to ~180s for local)
+
+### Binary Naming
+- GUI frontend: `fuego-wallet` (dash)
+- Rust backend: `fuego_walletd` (underscore)
+- Fuegod daemon: `fuegod`
+- Swap daemon: `xfg-swapd`
+
+### Port Layout
+| Port | Service |
+|------|---------|
+| 18180 | fuegod daemon RPC |
+| 18189 | fuego_walletd HTTP proxy (Dart connects here) |
+| 18900 | xfg-swapd status server |
+| 18901 | xfg-swapd P2P |
+| 18902 | xfg-swapd JSON-RPC (Dart Cross-Chain tab connects here) |
+
+## Rust SDK (fuego-sdk)
+
+Located at: `rust-fuego-wallet/fuego-sdk/fuego-sdk/src/`
+
+- `types.rs`: SwapPair enum (12 pairs), SwapOffer, SwapPrice, SwapTrade, SwapStatus
+- `chain/mod.rs`: ChainType enum (13 chains including Fuego), ChainSpv trait
+- `chain/bitcoin.rs`: Bitcoin-family SPV adapter (BTC, LTC, BCH, KMD, DCR)
+- `chain/evm.rs`: EVM chain adapter (ETH, ARB, BASE, BNB, POLYGON)
+- `chain/btc_rpc.rs`: Bitcoin JSON-RPC client
+- `chain/evm_rpc.rs`: Ethereum JSON-RPC client
+
+### ChainType Methods
+- `is_bitcoin_family()`: BitcoinCash, Komodo, Decred, Bitcoin, Litecoin
+- `is_evm()`: Ethereum, Arbitrum, Base, Bnb, Polygon
+- `from_symbol()`: Accepts "BSC" as alias for Bnb, "POLYGON"/"POLY" for Polygon
+
+## CI / Build
+
+- Flutter: 3.44.4
+- CI: ubuntu-22.04 (glibc 2.35)
+- macOS app bundle: `fuego-valise.app`
+- Rust backend binary: `fuego_walletd`
+- Default remote daemon: `207.244.247.64:18180`
+
+## fuego-suite submodule
+
+- `fuego-suite/` is a git submodule of `usexfg/fuego-suite`, tracking `master`, pinned to one commit. Clone with `--recurse-submodules`. Locally it replaces the old gitignored `xfgo/` checkout.
+- `fuego-ffi/build.rs` compiles CryptoNight (`slow-hash.c` etc.) directly from `fuego-suite/src/crypto`. There is no vendored copy. `cargo test -p fuego-ffi` checks it against canonical CN v0/v2 vectors.
+- Desktop CI builds `fuegod`/`xfg-swapd`/`unified` from the pinned submodule (`submodules: recursive`), not from a fresh clone of suite master.
+- suite's `src/CMakeLists.txt` adds `-march=native` to Crypto when `CI`/`GITHUB_*` is set at configure time. Every suite build in CI configures with `env -u CI -u GITHUB_ACTIONS -u GITHUB_REF -u GITHUB_RUN_ID`; otherwise released daemons SIGILL on CPUs older than the runner.
+- Dependabot (`gitsubmodule` ecosystem) opens a PR whenever suite master moves. Merging that PR is how the pin moves.
+- The Rust SDK is a Rust reimplementation of suite's C++ wire formats, not shared source. The submodule does not keep it in sync; only the fuegod wire-format CI job catches drift.
+- Wire-format check (CI job `fuegod-wire-check`): builds `fuegod` from the pin, runs it isolated with `--testnet` (ungates RPC on an unsynced node), and round-trips `fuego-sdk/tests/fuegod_wire.rs`. Locally: start fuegod the same way, then `FUEGOD_RPC_URL=http://127.0.0.1:28180 cargo test -p fuego-sdk --test fuegod_wire -- --ignored`.
+- Desktop build + bundling lives only in `.github/actions/build-desktop-backends` and `.github/actions/bundle-desktop-backends`; CI and every desktop release workflow (macOS, App Store, flatpak, snap) use them. Bundle layout: `fuego_walletd`, `fuegod`, `xfg-swapd`, `unified` next to the executable (`Contents/MacOS` on macOS); `libfuego_ffi` in `Contents/Frameworks` (macOS) or `lib/` (Linux). `scripts/sign-macos-app.sh` signs the result.
+- `libfuego_ffi.dylib` is built, never committed (`macos/Runner/libfuego_ffi.dylib` is gitignored). `scripts/build-and-run.sh` builds it for local macOS builds.
+- Linux release packages build on ubuntu-22.04: snap `core22` is 22.04 and `--destructive-mode` requires the host to match. Suite links Boost statically, so the daemons only need OpenSSL 3, libstdc++ and glibc at runtime.
+- iOS cannot spawn `fuego_walletd`; iOS release workflows do not build it. Without it iOS has no scanning, balance or sends. `docs/IOS_WALLETD_FFI_SCOPE.md` is the plan: walletd's server runs in-process, started through `fuego-ffi`.
+- iOS links the FFI statically: Runner's `OTHER_LDFLAGS` force-load `rust-fuego-wallet/target/<triple>/release/libfuego_ffi.a` (`aarch64-apple-ios` device, `aarch64-apple-ios-sim` / `x86_64-apple-ios` simulator) `-Xlinker -export_dynamic` stops dead-code stripping from dropping them (nothing native calls them; Dart looks them up at runtime), and `STRIP_STYLE = non-global` keeps them through symbol stripping, for `DynamicLibrary.process()`. The Runner build phase "Build fuego-ffi" (`scripts/build-ios-ffi.sh`) builds the slice for the SDK/arch Xcode is targeting, so a clean `flutter build ios` needs only Rust (`rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios`).
+- Linux bundles include a `fuego-valise` launcher symlink to the `fuegowallet` executable (`BINARY_NAME` in `linux/CMakeLists.txt`; "Fuego Valise" is only the display name); `linux/xfg-wallet.desktop` execs it.
+
+## Network selection
+
+- Mainnet/testnet: `FUEGO_TESTNET` env wins at launch, else the choice saved by Settings → Network (`node_network` pref). `NodeConnection.switchNetwork()` retargets ports/seeds, persists, and reconnects at runtime; `useTestnet` in `main.dart` follows it.
+- Chain clients (`daemon`, `hearthClient`) and `DexCubit` follow every reconnect through `NodeConnection.addListener`.
+
+## walletd wallet (vault seed)
+
+- walletd starts with no wallet (`--await-wallet`). After unlock, `WalletCubit` sends the vault seed with JSON-RPC `open_wallet` (loopback only). On any vault lock, `close_wallet` runs through `FuegoVaultService.addLockListener`. Wallet methods return `-32001 no wallet open` in between.
+- State lives per wallet in `<walletd data dir>/wallets/<id>/wallet_state.sled`. `<id>` is 8 bytes of Keccak("fuego-walletd-id" || B || A). The db stores its wallet id and refuses another wallet's seed.
+- `/scan_balance` answers only if the posted keys are the open wallet's (409 otherwise). The GUI reopens on 409 and never falls back to walletd `getBalance`.
+- Before this, walletd used its own random `master_seed.bin`. Balance, sends and sub-addresses were for that key, not the vault. If the file exists, walletd syncs it as the legacy wallet (`get_legacy_wallet`, `sweep_legacy_wallet`: 50 outputs per tx). The receive screen offers the sweep. The file is never deleted.
+- Headless use (no `--await-wallet`) keeps the old behaviour: `--seed` or `master_seed.bin`, state in the data-dir root.
+- Sync writes the block hash and the scan state in one atomic sled batch, and re-scanning a block is idempotent. Before this, a quit mid-batch left the stored hash ahead of the stored height, and the blocks in between were never scanned.
+- The app replaces a running walletd that lacks `wallet_status` (older build).
+
+## Sub-addresses
+
+- They follow fuego-suite's scheme (`src/crypto/subaddress.cpp`, ported to Rust as `fuego_crypto::derive_subaddress_keys`):
+  - The spend key is `D = B + H_s("Sublime" || a || major || minor)·G`.
+  - The view key is the master `A`.
+  - The prefix is the same as a main address, so senders need no changes.
+- `fuego_walletd` owns them: JSON-RPC `create_subaddress`, `get_subaddresses`, `register_legacy_subaddresses`, `sweep_legacy_subaddresses`.
+  - The scanner underives each output with the one master derivation and looks the result up in a spend-key table that runs 50 past the highest sub-address used.
+- They are linkable: every sub-address carries the master view key.
+- Pre-scheme "sub-addresses" (vault keypairs n and n+1) are `legacy` in `SubaddressStore`.
+  - Legacy sub-address 1's spend key is the main view key.
+  - Walletd rescans once when they are registered, and the receive screen offers to sweep them.
+
+## Commitment output keys (HEAT, LP, swap receipts, CDs)
+
+- They follow fuego-suite branch `keyderiv`. Its spec is `docs/developer/v11-p0-commitment-keys-and-asset-accounting-guide.md` in suite.
+  - **Owner-bound:** `P = derive_public_key(D, i, B)`, the same derivation as key outputs, with `B_sub` for a sub-address. Only `b` (or `b_sub`) gives the spend scalar `derive_secret_key(D, i, b)`.
+  - **Legacy:** `keyScalar = Hs("fuego_commit_key" || cn_fast_hash(D || i_LE32))`. The sender and any view-key holder can spend these outputs.
+- `BuildCommitmentDestination` carries the owner's `spend_pub` and `view_pub`.
+- **Creation is gated and defaults to the legacy form — `FUEGO_OWNER_BOUND_COMMITMENTS=1` opts in.** This is not a style choice; it is what keeps the wallet interoperable.
+  - The pinned daemon has **no owner-bound code**. `fuego-suite @ 524454d` has zero occurrences of `owner_bound`; its only commitment derivation is `deriveCommitmentKeys` (`src/CryptoNoteCore/TransactionExtra.cpp:1750`) and its only discovery rule is `src/Transfers/TransfersConsumer.cpp:124`, which compares against exactly that.
+  - An owner-bound output therefore **parses** but is never **attributed**. Sending HEAT/CD to a counterparty running the pinned daemon produces funds that wallet cannot find.
+  - Owner-bound exists only on the unpinned `keyderiv` branch (`0925d64c` on the submodule origin). Enable the gate only against a daemon that ships a matching discovery rule.
+  - The legacy default is a known weakness, not a fix: the sender and any view-key holder can spend those outputs. That is why the gate exists rather than a deletion.
+  - walletd logs a `warn!` at startup when the gate is ON.
+- **The scanner matches both forms unconditionally** — owner-bound first (underive, spend-key table for primary and sub-addresses, then `x·G == P`), legacy as fallback, plus pre-suite-scheme legacy accounts under their own view-key derivation. Matching is free readiness and costs no compatibility, so flipping the gate on does not orphan our own outputs.
+- No HEAT, Hearth, CD or atomic-swap transaction has been made on the network yet. No commitment outputs of either form exist.
+- `fuego-sdk/tests/commitment_owner_bound_vectors.rs` holds byte-for-byte vectors from keyderiv's C++:
+  - primary and sub-addresses (0,1) and (0,7);
+  - indices 0, 1, 127, 128 and 1,000,000;
+  - legacy forms.
+- `phase7_vectors.rs` splits by mode: `with_owner_bound(..)` wraps the four tests whose cross-language hashes were verified against the daemon's `parseAndValidate`, and `commitment_creation_defaults_to_the_interoperable_derivation` pins the default to the legacy form. The gate is process-global, so every gate-sensitive test takes a shared mutex.
+- Not compatible with `"fuego_commit_v2"` (suite `a0abbbeb`, valise `0b84fb5` on `claude/valise-sdk-suite-sync-9u8mdk`). Do not merge commitment-key code from those.
+
+## Transaction keys and fees
+
+- Every SDK builder takes the sender's **view secret**: r = Hs(viewSecret || inputsHash), as in suite's `generateDeterministicTransactionKeys`.
+  - Builders used to take the view public key. Then anyone holding the sender's address could recompute r.
+  - `get_tx_proof` tries the secret seed first, then the public seed, for transactions sent before the fix.
+- suite's `pushBlock` (v10+) conserves HEAT and LP exactly in every transaction except declared conversions (mint, Hearth swap, LP add/remove, limit orders). Only XFG leaves as the fee.
+  - The mempool checks only the combined sum, so a HEAT-paid fee is accepted there and then invalidates the block.
+  - walletd's HEAT send, CD create, claim and rollover pay MINIMUM_FEE in XFG through `build_commitment_spend_xfg_fee_transaction`.
+  - HEAT-paid fees wait for the v12 shielded pool: a fee asset would reveal the transaction type.
+- CD terms are DEPOSIT_MIN_TERM..=DEPOSIT_MAX_TERM (6 to 72 epochs). suite has no auto-roll (disabled until v13). 8 HEAT is the minimum amount.
+- Open in suite (keyderiv Part 2, not started):
+  - Commitment rings mix terms of one amount, and `classifyInputAsset` uses the first ring member.
+  - `fee_summary` pays the combined-asset fee to the miner as XFG.
+- walletd accepts any local caller; its only check is the `Host` header. Step 1 of the iOS scope doc adds token auth on all platforms.
+
+## CryptoNight / keys
+
+- `fuego-ffi/build.rs` compiles suite's `slow-hash.c` with two fixes to the portable path, which every Android ABI uses:
+  - the variant-2 light shuffle store offsets, which gave the wrong Fuego PoW;
+  - an unaligned `VARIANT1_INIT64` load.
+  It also defines `FORCE_USE_HEAP`. The fixes are skipped automatically once suite carries `fuego-ffi/patches/slow-hash-portable.patch`.
+- `Keypair::from_secret` stores the scalar reduced mod l. Unreduced secrets fail `sc_check`, so scanning and spending failed for about 15 of 16 wallets. Walletd rescans once when its stored `scan_version` is older.

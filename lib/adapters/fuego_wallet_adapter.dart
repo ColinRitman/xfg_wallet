@@ -2,9 +2,9 @@
 // Inspired by the QT wallet's WalletAdapter pattern
 
 import 'dart:async';
-
 import 'package:dio/dio.dart';
 import '../models/wallet.dart';
+import '../services/walletd_auth.dart';
 import '../models/network_config.dart';
 import 'package:flutter/foundation.dart';
 
@@ -24,7 +24,8 @@ class FuegoWalletAdapter {
 
   final Dio _dio;
   final String _walletRpcUrl;
-  NetworkConfig _networkConfig;
+  // ignore: unused_field — reserved for network-aware routing (mainnet vs testnet)
+  final NetworkConfig _networkConfig;
   Wallet? _wallet;
   bool _isOpen = false;
   bool _isSynchronized = false;
@@ -32,13 +33,15 @@ class FuegoWalletAdapter {
   StreamController<WalletEvent>? _eventController;
 
   FuegoWalletAdapter._internal()
-      : _dio = Dio(BaseOptions(
+    : _dio = WalletdAuth.dio(
+        BaseOptions(
           connectTimeout: const Duration(seconds: 30),
           receiveTimeout: const Duration(seconds: 30),
           headers: {'Content-Type': 'application/json'},
-        )),
-        _walletRpcUrl = 'http://localhost:8070',
-        _networkConfig = NetworkConfig.mainnet;
+        ),
+      ),
+      _walletRpcUrl = 'http://localhost:18189',
+      _networkConfig = NetworkConfig.mainnet;
 
   /// Open an existing wallet file
   Future<bool> open({
@@ -60,10 +63,7 @@ class FuegoWalletAdapter {
           'jsonrpc': '2.0',
           'id': 'test',
           'method': 'open_wallet',
-          'params': {
-            'filename': walletPath,
-            'password': password ?? '',
-          },
+          'params': {'filename': walletPath, 'password': password ?? ''},
         },
       );
 
@@ -110,7 +110,9 @@ class FuegoWalletAdapter {
       );
 
       if (response.data['error'] != null) {
-        _emitEvent(WalletEvent.creationFailed(response.data['error']['message']));
+        _emitEvent(
+          WalletEvent.creationFailed(response.data['error']['message']),
+        );
         return false;
       }
 
@@ -156,7 +158,9 @@ class FuegoWalletAdapter {
       );
 
       if (response.data['error'] != null) {
-        _emitEvent(WalletEvent.creationFailed(response.data['error']['message']));
+        _emitEvent(
+          WalletEvent.creationFailed(response.data['error']['message']),
+        );
         return false;
       }
 
@@ -166,7 +170,9 @@ class FuegoWalletAdapter {
       return true;
     } catch (e) {
       debugPrint('WalletAdapter createWithKeys failed: $e');
-      _emitEvent(WalletEvent.creationFailed('Failed to create wallet with keys: $e'));
+      _emitEvent(
+        WalletEvent.creationFailed('Failed to create wallet with keys: $e'),
+      );
       return false;
     }
   }
@@ -178,11 +184,7 @@ class FuegoWalletAdapter {
     try {
       final response = await _dio.post(
         '$_walletRpcUrl/json_rpc',
-        data: {
-          'jsonrpc': '2.0',
-          'id': 'test',
-          'method': 'getAddress',
-        },
+        data: {'jsonrpc': '2.0', 'id': 'test', 'method': 'getAddress'},
       );
 
       return response.data['result']['address'] as String;
@@ -199,11 +201,7 @@ class FuegoWalletAdapter {
     try {
       final response = await _dio.post(
         '$_walletRpcUrl/json_rpc',
-        data: {
-          'jsonrpc': '2.0',
-          'id': 'test',
-          'method': 'getBalance',
-        },
+        data: {'jsonrpc': '2.0', 'id': 'test', 'method': 'getBalance'},
       );
 
       return response.data['result']['balance'] as int;
@@ -220,11 +218,7 @@ class FuegoWalletAdapter {
     try {
       final response = await _dio.post(
         '$_walletRpcUrl/json_rpc',
-        data: {
-          'jsonrpc': '2.0',
-          'id': 'test',
-          'method': 'getBalance',
-        },
+        data: {'jsonrpc': '2.0', 'id': 'test', 'method': 'getBalance'},
       );
 
       return response.data['result']['unlocked_balance'] as int;
@@ -253,7 +247,7 @@ class FuegoWalletAdapter {
           'method': 'transfer',
           'params': {
             'destinations': destinations,
-            'fee': fee ?? 1000000000, // 0.01 XFG
+            'fee': fee ?? 1000000000, // deprecated default
             'payment_id': paymentId,
             'mixin': mixin,
             'get_tx_key': true,
@@ -267,40 +261,6 @@ class FuegoWalletAdapter {
     } catch (e) {
       debugPrint('sendTransaction failed: $e');
       throw Exception('Failed to send transaction: $e');
-    }
-  }
-
-  /// Create a deposit (CD banking)
-  Future<String> createDeposit({
-    required int term, // in blocks (e.g., 777600 for 90 days @ 1 block/min)
-    required int amount,
-    int? fee,
-    int mixin = 4,
-  }) async {
-    if (!_isOpen) throw Exception('Wallet is not open');
-
-    try {
-      final response = await _dio.post(
-        '$_walletRpcUrl/json_rpc',
-        data: {
-          'jsonrpc': '2.0',
-          'id': 'test',
-          'method': 'create_deposit',
-          'params': {
-            'term': term,
-            'amount': amount,
-            'fee': fee ?? 1000000000,
-            'mixin': mixin,
-          },
-        },
-      );
-
-      final txHash = response.data['result']['tx_hash'] as String;
-      _emitEvent(WalletEvent.depositCreated(txHash));
-      return txHash;
-    } catch (e) {
-      debugPrint('createDeposit failed: $e');
-      throw Exception('Failed to create deposit: $e');
     }
   }
 
@@ -318,10 +278,7 @@ class FuegoWalletAdapter {
           'jsonrpc': '2.0',
           'id': 'test',
           'method': 'withdraw_deposit',
-          'params': {
-            'deposit_ids': depositIds,
-            'fee': fee ?? 1000000000,
-          },
+          'params': {'deposit_ids': depositIds, 'fee': fee ?? 1000000000},
         },
       );
 
@@ -341,11 +298,7 @@ class FuegoWalletAdapter {
     try {
       await _dio.post(
         '$_walletRpcUrl/json_rpc',
-        data: {
-          'jsonrpc': '2.0',
-          'id': 'test',
-          'method': 'store',
-        },
+        data: {'jsonrpc': '2.0', 'id': 'test', 'method': 'store'},
       );
       return true;
     } catch (e) {
@@ -403,11 +356,7 @@ class WalletEvent {
   final String? message;
   final Map<String, dynamic>? data;
 
-  WalletEvent({
-    required this.type,
-    this.message,
-    this.data,
-  });
+  WalletEvent({required this.type, this.message, this.data});
 
   factory WalletEvent.opened() => WalletEvent(type: WalletEventType.opened);
   factory WalletEvent.openFailed(String message) =>
@@ -417,18 +366,19 @@ class WalletEvent {
       WalletEvent(type: WalletEventType.creationFailed, message: message);
   factory WalletEvent.closed() => WalletEvent(type: WalletEventType.closed);
   factory WalletEvent.transactionCreated(String txHash) => WalletEvent(
-        type: WalletEventType.transactionCreated,
-        data: {'txHash': txHash},
-      );
+    type: WalletEventType.transactionCreated,
+    data: {'txHash': txHash},
+  );
   factory WalletEvent.depositCreated(String txHash) => WalletEvent(
-        type: WalletEventType.depositCreated,
-        data: {'txHash': txHash},
-      );
+    type: WalletEventType.depositCreated,
+    data: {'txHash': txHash},
+  );
   factory WalletEvent.depositWithdrawalCreated(String txHash) => WalletEvent(
-        type: WalletEventType.depositWithdrawalCreated,
-        data: {'txHash': txHash},
-      );
-  factory WalletEvent.synchronizationProgress(int current, int total) => WalletEvent(
+    type: WalletEventType.depositWithdrawalCreated,
+    data: {'txHash': txHash},
+  );
+  factory WalletEvent.synchronizationProgress(int current, int total) =>
+      WalletEvent(
         type: WalletEventType.synchronizationProgress,
         data: {'current': current, 'total': total},
       );

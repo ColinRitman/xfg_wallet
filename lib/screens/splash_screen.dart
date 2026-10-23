@@ -1,11 +1,15 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:provider/provider.dart';
 import 'package:animated_text_kit/animated_text_kit.dart';
+import '../main.dart' as app;
 import '../providers/wallet_provider.dart';
 import '../services/security_service.dart';
 import '../utils/theme.dart';
-import 'wallet_setup/setup_screen.dart';
+
 import 'auth/pin_entry_screen.dart';
+import 'main/main_screen.dart';
+import '../../utils/xfg_ticker.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -22,13 +26,31 @@ class _SplashScreenState extends State<SplashScreen>
   late Animation<Offset> _slideAnimation;
 
   bool _isInitializing = true;
-  String _initMessage = 'Initializing XF₲ Wallet...';
+  String _initMessage = 'Initializing Fuego Valise...';
+  String _versionString = '';
+  String? _daemonWarning;
 
   @override
   void initState() {
     super.initState();
     _setupAnimations();
+    _loadVersion();
     _initializeApp();
+  }
+
+  Future<void> _loadVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      setState(() {
+        _versionString =
+            'Fuego Valise v${info.version} • Privacy Bank & Purchasing Power Chain';
+      });
+    } catch (_) {
+      setState(() {
+        _versionString =
+            'Fuego Valise v5.11.0 • Privacy Bank & Purchasing Power Chain';
+      });
+    }
   }
 
   void _setupAnimations() {
@@ -42,21 +64,14 @@ class _SplashScreenState extends State<SplashScreen>
       vsync: this,
     );
 
-    _fadeAnimation = Tween<double>(
-      begin: 0.0,
-      end: 1.0,
-    ).animate(CurvedAnimation(
-      parent: _fadeController,
-      curve: Curves.easeInOut,
-    ));
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut),
+    );
 
-    _slideAnimation = Tween<Offset>(
-      begin: const Offset(0, 0.5),
-      end: Offset.zero,
-    ).animate(CurvedAnimation(
-      parent: _slideController,
-      curve: Curves.easeOutBack,
-    ));
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.5), end: Offset.zero).animate(
+          CurvedAnimation(parent: _slideController, curve: Curves.easeOutBack),
+        );
 
     // Start animations
     _fadeController.forward();
@@ -67,45 +82,85 @@ class _SplashScreenState extends State<SplashScreen>
 
   Future<void> _initializeApp() async {
     try {
-      // Simulate initialization delay for smooth animation
-      await Future.delayed(const Duration(milliseconds: 2000));
-
+      // Splash visible for at least 3 seconds
+      await Future.delayed(const Duration(seconds: 3));
       if (!mounted) return;
 
       setState(() {
         _initMessage = 'Checking wallet status...';
       });
 
+      // Check for daemon errors
+      if (app.daemonError != null) {
+        setState(() {
+          _daemonWarning = app.daemonError;
+        });
+      }
+
       final securityService = SecurityService();
-      final walletProvider = Provider.of<WalletProvider>(context, listen: false);
+      final walletProvider = Provider.of<WalletProvider>(
+        context,
+        listen: false,
+      );
 
-      // Check if wallet exists
-      final hasWallet = await walletProvider.hasWalletData();
-      final hasPIN = await securityService.hasPIN();
+      // Do NOT clear lockout unconditionally — that bypasses brute-force protection.
+      // isLockedOut() already clears only if expired; stale lockout must persist until expiry.
+      bool hasWallet = false;
+      bool hasPIN = false;
+      bool isLocked = false;
+      bool checkFailed = false;
+      try {
+        hasWallet = await walletProvider.hasWalletData();
+        hasPIN = await securityService.hasPIN();
+        isLocked = await securityService.isLockedOut();
+      } catch (e) {
+        // Fail closed: a thrown check (e.g. transient Android Keystore /
+        // iOS Keychain error right after reboot, before first unlock) must
+        // never be read as "no PIN exists" — that would route straight to
+        // MainScreen and expose live balance/address/history with zero
+        // authentication. A genuinely new user with no wallet still has an
+        // escape hatch via "Forgot PIN" → Reset Wallet on PinEntryScreen.
+        checkFailed = true;
+        debugPrint(
+          'Secure storage check failed — failing closed to PinEntryScreen',
+        );
+      }
 
-      await Future.delayed(const Duration(milliseconds: 1000));
-
+      await Future.delayed(const Duration(milliseconds: 800));
       if (!mounted) return;
 
-      // Navigation logic
-      if (hasWallet && hasPIN) {
-        // Wallet exists, go to PIN entry
+      setState(() => _isInitializing = false);
+
+      // Enforce PIN gate: if wallet exists and PIN set, require unlock before main.
+      if (isLocked) {
+        final remain = await securityService.lockoutRemaining();
+        setState(() {
+          _initMessage = remain != null
+              ? 'Too many attempts — try again in ${remain.inMinutes}m ${remain.inSeconds % 60}s'
+              : 'Wallet locked — try again later';
+        });
+        await Future.delayed(const Duration(milliseconds: 1500));
+        if (!mounted) return;
         _navigateToScreen(const PinEntryScreen());
-      } else {
-        // No wallet, go to setup
-        _navigateToScreen(const SetupScreen());
+        return;
       }
+      if (checkFailed || (hasWallet && hasPIN)) {
+        _navigateToScreen(const PinEntryScreen());
+        return;
+      }
+      _navigateToScreen(const MainScreen());
     } catch (e) {
       if (!mounted) return;
-      
+
       setState(() {
-        _initMessage = 'Error: ${e.toString()}';
+        _initMessage =
+            'Unable to initialize securely. Please unlock or set up.';
       });
 
-      // Show error and navigate to setup after delay
-      await Future.delayed(const Duration(milliseconds: 2000));
+      await Future.delayed(const Duration(milliseconds: 1500));
       if (mounted) {
-        _navigateToScreen(const SetupScreen());
+        // Fail closed here too — see rationale above.
+        _navigateToScreen(const PinEntryScreen());
       }
     }
   }
@@ -115,10 +170,7 @@ class _SplashScreenState extends State<SplashScreen>
       PageRouteBuilder(
         pageBuilder: (context, animation, secondaryAnimation) => screen,
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return FadeTransition(
-            opacity: animation,
-            child: child,
-          );
+          return FadeTransition(opacity: animation, child: child);
         },
         transitionDuration: const Duration(milliseconds: 800),
       ),
@@ -136,9 +188,7 @@ class _SplashScreenState extends State<SplashScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       body: Container(
-        decoration: const BoxDecoration(
-          gradient: AppTheme.backgroundGradient,
-        ),
+        decoration: const BoxDecoration(gradient: AppTheme.backgroundGradient),
         child: SafeArea(
           child: Column(
             children: [
@@ -180,7 +230,7 @@ class _SplashScreenState extends State<SplashScreen>
                           AnimatedTextKit(
                             animatedTexts: [
                               TypewriterAnimatedText(
-                                'Fyrefly XF₲_wallet',
+                                'Fuego (XFG) Wallet',
                                 textStyle: const TextStyle(
                                   fontSize: 28,
                                   fontWeight: FontWeight.bold,
@@ -193,13 +243,49 @@ class _SplashScreenState extends State<SplashScreen>
                             totalRepeatCount: 1,
                           ),
                           const SizedBox(height: 16),
-                          // Subtitle
+                          // Brand
                           Text(
-                            'Privacy Blockchain Banking',
+                            'HEATWAVE v1.11.0 (Suite) Release',
                             style: TextStyle(
-                              fontSize: 16,
+                              fontSize: 20,
+                              color: AppTheme.primaryColor,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 2,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'feat HEARTH Floor | DeXFG',
+                            style: TextStyle(
+                              fontSize: 14,
                               color: AppTheme.textSecondary,
                               fontWeight: FontWeight.w300,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          // Swap pair
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: AppTheme.surfaceColor,
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                color: AppTheme.primaryColor.withOpacity(0.3),
+                                width: 1,
+                              ),
+                            ),
+                            child: Text(
+                              'XFG + ΗΞΔŦ',
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: AppTheme.primaryColor,
+                                fontWeight: FontWeight.w600,
+                                letterSpacing: 1.5,
+                              ),
                             ),
                           ),
                         ],
@@ -235,6 +321,42 @@ class _SplashScreenState extends State<SplashScreen>
                         textAlign: TextAlign.center,
                       ),
                     ),
+                    // Daemon error banner
+                    if (_daemonWarning != null) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 32),
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: AppTheme.warningColor.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: AppTheme.warningColor.withValues(alpha: 0.3),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(
+                              Icons.warning_amber_rounded,
+                              color: AppTheme.warningColor,
+                              size: 16,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                _daemonWarning!,
+                                style: const TextStyle(
+                                  color: AppTheme.warningColor,
+                                  fontSize: 12,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -243,8 +365,21 @@ class _SplashScreenState extends State<SplashScreen>
                 padding: const EdgeInsets.all(16),
                 child: Column(
                   children: [
+                    if (_versionString.isNotEmpty) ...[
+                      Text(
+                        _versionString,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.primaryColor.withOpacity(0.7),
+                          fontWeight: FontWeight.w400,
+                          letterSpacing: 0.5,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 8),
+                    ],
                     Text(
-                      'Based on CryptoNote Protocol',
+                      'Based upon the CryptoNote protocol',
                       style: TextStyle(
                         fontSize: 12,
                         color: AppTheme.textMuted,
@@ -262,9 +397,9 @@ class _SplashScreenState extends State<SplashScreen>
                         ),
                         const SizedBox(width: 8),
                         Text(
-                          'Secure • Untraceable • Decentralized',
+                          'Sovereign • Untraceable • Purchasing Power',
                           style: TextStyle(
-                            fontSize: 10,
+                            fontSize: 12,
                             color: AppTheme.textMuted,
                             fontWeight: FontWeight.w400,
                           ),
@@ -311,13 +446,9 @@ class _AnimatedFuegoLogoState extends State<AnimatedFuegoLogo>
       vsync: this,
     );
 
-    _pulseAnimation = Tween<double>(
-      begin: 0.8,
-      end: 1.2,
-    ).animate(CurvedAnimation(
-      parent: _pulseController,
-      curve: Curves.easeInOut,
-    ));
+    _pulseAnimation = Tween<double>(begin: 0.8, end: 1.2).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
 
     _rotateAnimation = Tween<double>(
       begin: 0,

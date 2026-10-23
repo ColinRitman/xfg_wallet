@@ -22,3 +22,24 @@ coverage/
 
 # Environment
 .env
+payment_gate.log
+
+# Native build artifacts
+*.dylib
+*.so
+*.dll
+*.a
+macos/Runner/libfuego_ffi.dylib
+
+# Build outputs / scratch
+src/Release/
+det_*.json
+
+# Vendored C++ daemon (separate upstream repo)
+xfgo/
+
+# Unbundled font drops (not wired in pubspec)
+assets/fonts/Noto_Serif_Display/
+
+# Claude Code agent worktrees
+.claude/worktrees/
